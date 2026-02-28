@@ -49,8 +49,8 @@ public sealed class MediaSourceManagerDecorator(
     Lazy<SubtitleProvider> subtitleProvider,
     IMediaSegmentManager mediaSegmentManager,
     IEnumerable<ICustomMetadataProvider<Video>> videoProbeProviders,
-    ISyncPlayManager syncPlayManager,
-    ISessionManager sessionManager
+    Lazy<ISyncPlayManager> syncPlayManager,
+    Lazy<ISessionManager> sessionManager
 ) : IMediaSourceManager
 {
     private readonly IMediaSourceManager _inner =
@@ -70,8 +70,8 @@ public sealed class MediaSourceManagerDecorator(
     private readonly Lazy<SubtitleProvider> _subtitleProvider = subtitleProvider;
 
     //  private readonly Lazy<ISubtitleManager> _subtitleManager = subtitleManager ?? throw new ArgumentNullException(nameof(subtitleManager));
-    private readonly ISyncPlayManager _syncPlayManager = syncPlayManager;
-    private readonly ISessionManager _sessionManager = sessionManager;
+    private readonly Lazy<ISyncPlayManager> _syncPlayManager = syncPlayManager;
+    private readonly Lazy<ISessionManager> _sessionManager = sessionManager;
     private readonly ICustomMetadataProvider<Video>? _probeProvider =
         videoProbeProviders.FirstOrDefault(p => p.Name == "Probe Provider");
 
@@ -361,7 +361,7 @@ public sealed class MediaSourceManagerDecorator(
         string? prevSyncPlaySourceId = null;
         var hadExplicitSource = ctx?.Items.ContainsKey("MediaSourceId") == true;
 
-        try { isSyncPlay = _syncPlayManager.IsUserActive(user.Id); }
+        try { isSyncPlay = _syncPlayManager.Value.IsUserActive(user.Id); }
         catch { /* SyncPlay manager unavailable */ }
 
         if (isSyncPlay)
@@ -789,12 +789,12 @@ public sealed class MediaSourceManagerDecorator(
             if (groupId is null) return;
 
             // Find the initiator's session (needed as controllingSessionId).
-            var initiatorSession = _sessionManager.Sessions
+            var initiatorSession = _sessionManager.Value.Sessions
                 .FirstOrDefault(s => s.UserId == initiatorUserId);
             if (initiatorSession is null) return;
 
             // Find other group members' active sessions.
-            var targets = _sessionManager.Sessions
+            var targets = _sessionManager.Value.Sessions
                 .Where(s =>
                     s.UserId != initiatorUserId
                     && SyncPlayGroupTracker.GetGroupForUser(s.UserId) == groupId)
@@ -811,7 +811,7 @@ public sealed class MediaSourceManagerDecorator(
                     ControllingUserId = initiatorUserId,
                 };
 
-                await _sessionManager.SendPlayCommand(
+                await _sessionManager.Value.SendPlayCommand(
                     initiatorSession.Id,
                     target.Id,
                     command,
