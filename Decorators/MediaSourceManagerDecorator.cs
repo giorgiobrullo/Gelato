@@ -559,6 +559,15 @@ public sealed class MediaSourceManagerDecorator(
             }
         }
 
+        // Prevent Jellyfin's MatroskaKeyframeExtractor from calling File.OpenRead on
+        // HTTP(S) URLs. Appending a URL fragment breaks .mkv extension matching in both
+        // IsExtractionAllowedForFile and MatroskaKeyframeExtractor.TryExtractKeyframes,
+        // while ffmpeg and HTTP clients strip fragments natively.
+        if (info.Path?.StartsWith("http", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            info.Path += "#";
+        }
+
         // massive cheat. clients will direct play remote files directly. But we always want to proxy it.
         // just fake a real file.
         if (ctx.GetActionName() == "GetPostedPlaybackInfo")
