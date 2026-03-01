@@ -352,6 +352,15 @@ internal sealed class VersionList(
             }
         }
 
+        // Prevent Jellyfin's MatroskaKeyframeExtractor from calling File.OpenRead on
+        // HTTP(S) URLs. Appending a URL fragment breaks .mkv extension matching in both
+        // IsExtractionAllowedForFile and MatroskaKeyframeExtractor.TryExtractKeyframes,
+        // while ffmpeg and HTTP clients strip fragments natively.
+        if (info.Path?.StartsWith("http", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            info.Path += "#";
+        }
+
         info.Bitrate = item.TotalBitrate;
         info.InferTotalBitrate();
 
