@@ -121,14 +121,18 @@ public sealed class MediaSourceManagerDecorator(
             : itemCacheKey;
 
         // SyncPlay users can reuse streams fetched by any group member,
-        // so check a shared (user-agnostic) key first.
+        // but each user still needs their own SyncStreams pass so their
+        // userId is registered on the stream items.  Only skip when BOTH
+        // the shared key (= addons already fetched) AND the per-user key
+        // (= this user already synced) are set.
         var isSyncPlayCacheHit = false;
         if (allowSync && userId != Guid.Empty)
         {
             try
             {
                 if (_syncPlayManager.Value.IsUserActive(userId)
-                    && manager.HasStreamSync(itemCacheKey))
+                    && manager.HasStreamSync(itemCacheKey)
+                    && manager.HasStreamSync(cacheKey))
                 {
                     isSyncPlayCacheHit = true;
                 }
@@ -426,22 +430,38 @@ public sealed class MediaSourceManagerDecorator(
 
         if (NeedsProbe(selected))
         {
-            var libraryOptions = _libraryManager.GetLibraryOptions(owner);
+            // Serialize probes per stream item so concurrent SyncPlay
+            // requests don't race on the temporary owner.Path swap inside
+            // ProbeStreamAsync (which would corrupt origPath for the loser).
+            await _lock.RunQueuedAsync(
+                owner.Id,
+                async probeCt =>
+                {
+                    // Re-check after acquiring the lock — another request
+                    // may have probed while we waited.
+                    var recheck = GetStaticMediaSources(item, enablePathSubstitution, user);
+                    var recheckSel = SelectByIdOrFirst(recheck, mediaSourceId);
+                    if (recheckSel is not null && !NeedsProbe(recheckSel))
+                        return;
 
-            var segmentTask = _mediaSegmentManager.RunSegmentPluginProviders(
-                owner,
-                libraryOptions,
-                false,
+                    var libraryOptions = _libraryManager.GetLibraryOptions(owner);
+
+                    var segmentTask = _mediaSegmentManager.RunSegmentPluginProviders(
+                        owner,
+                        libraryOptions,
+                        false,
+                        probeCt
+                    );
+                    var metadataTask = ProbeStreamAsync((Video)owner, selected.Path, probeCt);
+
+                    await Task.WhenAll(metadataTask, segmentTask).ConfigureAwait(false);
+
+                    await owner
+                        .UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, probeCt)
+                        .ConfigureAwait(false);
+                },
                 ct
-            );
-            var metadataTask = ProbeStreamAsync((Video)owner, selected.Path, ct);
-            //  var subtitleTask = DownloadSubtitles((Video)owner, ct);
-
-            await Task.WhenAll(metadataTask, segmentTask).ConfigureAwait(false);
-
-            await owner
-                .UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, ct)
-                .ConfigureAwait(false);
+            ).ConfigureAwait(false);
 
             var refreshed = GetStaticMediaSources(item, enablePathSubstitution, user);
             selected = SelectByIdOrFirst(refreshed, mediaSourceId);
