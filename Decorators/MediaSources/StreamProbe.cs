@@ -207,7 +207,17 @@ internal sealed class StreamProbe(
         });
     }
 
-    internal async Task ProbeStreamAsync(Video owner, string streamUrl, CancellationToken ct)
+    // One probe per row at a time. The probe points the row's (shared, cached) item at a
+    // temporary .strm named after the row: a second probe of the same row that started meanwhile
+    // (two SyncPlay members pressing play together) took that temporary path for the row's own
+    // and put it back last, which saved the row with a path to a deleted file (ffmpeg -i ""), or
+    // found the .strm deleted under it by the first.
+    private readonly KeyLock _probes = new();
+
+    internal Task ProbeStreamAsync(Video owner, string streamUrl, CancellationToken ct) =>
+        _probes.RunQueuedAsync(owner.Id, token => ProbeStreamCoreAsync(owner, streamUrl, token), ct);
+
+    private async Task ProbeStreamCoreAsync(Video owner, string streamUrl, CancellationToken ct)
     {
         // Named after the row, not the release: Jellyfin's probe takes subtitle files named like
         // the release, which is how Gelato saves them, into the row's streams at index 0 and
