@@ -595,7 +595,18 @@
             if (chkEnableJavaScriptInjection) chkEnableJavaScriptInjection.checked = cfg.EnableJavaScriptInjection || false;
             if (chkLazyImages) chkLazyImages.checked = cfg.LazyImages ?? false;
 
-            // User Overrides Logic
+            // User Overrides — API returns an array, convert to object keyed by UserId
+            const userConfigsArray = cfg.UserConfigs || [];
+            cfg.UserConfigs = {};
+            userConfigsArray.forEach(uc => {
+              cfg.UserConfigs[uc.UserId] = {
+                Url: uc.Url,
+                MoviePath: uc.MoviePath,
+                SeriesPath: uc.SeriesPath,
+                DisableSearch: uc.DisableSearch
+              };
+            });
+
             await loadUsers();
             renderOverridesList();
 
