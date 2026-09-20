@@ -6,6 +6,7 @@ using Gelato.ScheduledTasks;
 using Gelato.Services;
 //using IntroDbPlugin.Services;
 using MediaBrowser.Controller;
+using MediaBrowser.Controller.Chapters;
 using MediaBrowser.Controller.Collections;
 using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.Dto;
@@ -18,6 +19,7 @@ using MediaBrowser.Controller.Providers;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Controller.Subtitles;
 using MediaBrowser.Controller.SyncPlay;
+using MediaBrowser.Controller.Trickplay;
 using MediaBrowser.Model.Providers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -37,15 +39,26 @@ public class ServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton<DeleteResourceFilter>();
         services.AddSingleton<DownloadFilter>();
         services.AddSingleton<SyncPlayGroupFilter>();
+        services.AddSingleton<StreamUserDataFilter>();
+        services.AddSingleton<VersionActionFilter>();
+        services.AddSingleton<UnreleasedListingFilter>();
         services.AddSingleton<GelatoManager>();
         services.DecorateSingle<IItemRepository, GelatoItemRepository>();
         services.AddSingleton(sp => (GelatoItemRepository)sp.GetRequiredService<IItemRepository>());
+        services.DecorateSingle<IUserDataManager, UserDataManagerDecorator>();
+        services.AddSingleton(sp =>
+            (UserDataManagerDecorator)sp.GetRequiredService<IUserDataManager>()
+        );
+        services.DecorateSingle<IItemCountService, ItemCountServiceDecorator>();
         services.AddSingleton<GelatoStremioProviderFactory>();
         services.AddSingleton(sp => new Lazy<GelatoManager>(sp.GetRequiredService<GelatoManager>));
         services.AddSingleton<CatalogService>();
         services.AddSingleton<CatalogImportService>();
         services.AddSingleton<PalcoCacheService>();
         services.AddSingleton<IHostedService, GelatoJavaScriptRegistrationService>();
+        services.AddSingleton<IHostedService, UpgradeRepairService>();
+        services.AddSingleton<IHostedService, StreamUserDataSync>();
+        services.AddSingleton<IHostedService, LegacyRowAdoptionService>();
         services.AddSingleton<SubtitleProvider>();
         services.AddSingleton<ISubtitleProvider>(sp => sp.GetRequiredService<SubtitleProvider>());
         services.AddSingleton(sp => new Lazy<SubtitleProvider>(
@@ -95,17 +108,22 @@ public class ServiceRegistrator : IPluginServiceRegistrator
         services
             .DecorateSingle<IDtoService, DtoServiceDecorator>()
             .DecorateSingle<IMediaSourceManager, MediaSourceManagerDecorator>()
+            .DecorateSingle<ISimilarItemsManager, SimilarItemsManagerDecorator>()
             .DecorateSingle<ICollectionManager, CollectionManagerDecorator>()
             .DecorateSingle<IPlaylistManager, PlaylistManagerDecorator>()
             .DecorateSingle<ISubtitleManager, SubtitleManagerDecorator>()
             .DecorateSingle<IProviderManager, ProviderManagerDecorator>()
-            .DecorateSingle<IImageProcessor, ImageProcessorDecorator>();
+            .DecorateSingle<IImageProcessor, ImageProcessorDecorator>()
+            .DecorateSingle<ITrickplayManager, TrickplayManagerDecorator>()
+            .DecorateSingle<IChapterManager, ChapterManagerDecorator>();
         // Expose the concrete decorator as Lazy so ImageProcessorDecorator can call SaveImageDirect
         // without introducing a circular dependency at construction time.
         services.AddSingleton(sp => new Lazy<ProviderManagerDecorator>(
             () => (ProviderManagerDecorator)sp.GetRequiredService<IProviderManager>()));
         services.AddSingleton(sp => new Lazy<ILibraryManager>(
             sp.GetRequiredService<ILibraryManager>));
+        services.AddSingleton(sp => new Lazy<IProviderManager>(
+            sp.GetRequiredService<IProviderManager>));
         services.AddSingleton(sp => new Lazy<ISubtitleManager>(
             sp.GetRequiredService<ISubtitleManager>
         ));
@@ -119,6 +137,9 @@ public class ServiceRegistrator : IPluginServiceRegistrator
             o.Filters.AddService<DeleteResourceFilter>();
             o.Filters.AddService<DownloadFilter>();
             o.Filters.AddService<SyncPlayGroupFilter>();
+            o.Filters.AddService<StreamUserDataFilter>();
+            o.Filters.AddService<VersionActionFilter>();
+            o.Filters.AddService<UnreleasedListingFilter>();
         });
     }
 

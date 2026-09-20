@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Jellyfin.Data.Enums;
 using Jellyfin.Data.Events;
+using MediaBrowser.Common.Net;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
@@ -17,6 +18,7 @@ public sealed class GelatoSeriesProvider : IRemoteMetadataProvider<Series, Serie
     private readonly ILibraryManager _libraryManager;
     private readonly GelatoManager _manager;
     private readonly IProviderManager _provider;
+    private readonly IHttpClientFactory _http;
     private readonly ConcurrentDictionary<Guid, DateTime> _syncCache = new();
     private static readonly TimeSpan CacheExpiry = TimeSpan.FromMinutes(2);
 
@@ -24,13 +26,15 @@ public sealed class GelatoSeriesProvider : IRemoteMetadataProvider<Series, Serie
         ILogger<GelatoSeriesProvider> logger,
         ILibraryManager libraryManager,
         IProviderManager provider,
-        GelatoManager manager
+        GelatoManager manager,
+        IHttpClientFactory http
     )
     {
         _log = logger;
         _libraryManager = libraryManager;
         _manager = manager;
         _provider = provider;
+        _http = http;
 
         _provider.RefreshStarted += OnProviderManagerRefreshStarted;
     }
@@ -153,11 +157,13 @@ public sealed class GelatoSeriesProvider : IRemoteMetadataProvider<Series, Serie
         StremioMeta? meta;
         try
         {
-            meta = await stremio.GetMetaAsync(id, StremioMediaType.Series).ConfigureAwait(false);
+            meta = await stremio
+                .GetMetaAsync(info.ProviderIds, StremioMediaType.Series)
+                .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            _log.LogWarning(ex, "GelatoSeriesProvider: failed to fetch meta for {Id}", id);
+            _log.LogWarning(ex, "GelatoSeriesProvider: failed to fetch meta for {Name}", info.Name);
             return result;
         }
 
@@ -168,6 +174,7 @@ public sealed class GelatoSeriesProvider : IRemoteMetadataProvider<Series, Serie
             return result;
 
         series.ProviderIds.Remove("Stremio");
+        series.KeepEndDateOnlyForGelato(info.ProviderIds);
         result.HasMetadata = true;
         result.Item = series;
         MapPeople(meta, result);
@@ -200,10 +207,7 @@ public sealed class GelatoSeriesProvider : IRemoteMetadataProvider<Series, Serie
     public Task<HttpResponseMessage> GetImageResponse(
         string url,
         CancellationToken cancellationToken
-    )
-    {
-        throw new NotImplementedException();
-    }
+    ) => _http.CreateClient(NamedClient.Default).GetAsync(url, cancellationToken);
 
     private static void MapPeople(StremioMeta meta, MetadataResult<Series> result)
     {

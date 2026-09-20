@@ -27,6 +27,11 @@ public class GelatoStremioProvider(
         (StremioMeta Meta, DateTime Expiry)
     > _metaCache = new(StringComparer.OrdinalIgnoreCase);
 
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<
+        string,
+        string?
+    > _tmdbIdByImdbId = new(StringComparer.OrdinalIgnoreCase);
+
     private StremioMeta? GetCachedMeta(string id)
     {
         if (_metaCache.TryGetValue(id, out var entry) && entry.Expiry > DateTime.UtcNow)
@@ -61,7 +66,15 @@ public class GelatoStremioProvider(
 
     private async Task<T?> GetJsonAsync<T>(string url)
     {
-        log.LogDebug("GetJsonAsync: requesting {Url}", url);
+        // The base URL carries the user's addon config, so only the resource after it is logged.
+        var resource = url.StartsWith(baseUrl, StringComparison.Ordinal)
+            ? url[baseUrl.Length..]
+            : Redact.Url(url);
+        log.LogDebug(
+            "GetJsonAsync: requesting {Resource} from {Addon}",
+            resource,
+            Redact.Url(baseUrl)
+        );
 
         try
         {
@@ -71,8 +84,8 @@ public class GelatoStremioProvider(
             if (!resp.IsSuccessStatusCode)
             {
                 log.LogWarning(
-                    "GetJsonAsync: request failed for {Url} with {StatusCode} {ReasonPhrase}",
-                    url,
+                    "GetJsonAsync: request failed for {Resource} with {StatusCode} {ReasonPhrase}",
+                    resource,
                     resp.StatusCode,
                     resp.ReasonPhrase
                 );
@@ -89,7 +102,12 @@ public class GelatoStremioProvider(
         }
         catch (Exception ex)
         {
-            log.LogError(ex, "GetJsonAsync: error fetching or parsing {Url}", url);
+            log.LogError(
+                ex,
+                "GetJsonAsync: error fetching or parsing {Resource} from {Addon}",
+                resource,
+                Redact.Url(baseUrl)
+            );
             throw;
         }
     }
@@ -178,21 +196,133 @@ public class GelatoStremioProvider(
         return r?.Meta;
     }
 
+    /// <summary>
+    /// Fetches the meta of a catalog result by every id it carries: its own (<c>tt</c>,
+    /// <c>tmdb:</c>, ...) and, when it has one, its <c>imdb_id</c>. An addon's meta resource does
+    /// not have to accept both formats - AIOStreams' tmdb-addon preset declares only <c>tmdb:</c>
+    /// and answers 404 for an IMDb id - so asking for one id alone can fail although the addon has
+    /// the meta under the other one.
+    /// </summary>
+    public async Task<StremioMeta?> GetMetaAsync(StremioMeta meta, TimeSpan? ttl = null)
+    {
+        return await GetMetaAsync([meta.ImdbId, meta.Id], meta.Type, ttl).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc cref="GetMetaAsync(StremioMeta, TimeSpan?)"/>
+    public async Task<StremioMeta?> GetMetaAsync(
+        IReadOnlyDictionary<string, string> providerIds,
+        StremioMediaType mediaType,
+        TimeSpan? ttl = null
+    )
+    {
+        providerIds.TryGetValue(nameof(MetadataProvider.Imdb), out var imdbId);
+        providerIds.TryGetValue(nameof(MetadataProvider.Tmdb), out var tmdbId);
+        return await GetMetaAsync(
+                [imdbId, string.IsNullOrWhiteSpace(tmdbId) ? null : $"tmdb:{tmdbId}"],
+                mediaType,
+                ttl
+            )
+            .ConfigureAwait(false);
+    }
+
     public async Task<StremioMeta?> GetMetaAsync(BaseItem item)
     {
-        var id = item.GetProviderId("Imdb");
-        if (id is null)
-        {
+        var imdbId = item.GetProviderId("Imdb");
+        var tmdbId = item.GetProviderId("Tmdb");
+        if (imdbId is null)
             log.LogWarning("GetMetaAsync: {Name} has no imdb ID", item.Name);
-            id = item.GetProviderId("Tmdb");
-            if (id is null)
-            {
-                log.LogWarning("GetMetaAsync: {Name} has no imdb and tmdb ID", item.Name);
-                return null;
-            }
-            id = $"tmdb:{id}";
+        if (imdbId is null && tmdbId is null)
+        {
+            log.LogWarning("GetMetaAsync: {Name} has no imdb and tmdb ID", item.Name);
+            return null;
         }
-        return await GetMetaAsync(id, item.GetBaseItemKind().ToStremio()).ConfigureAwait(false);
+
+        return await GetMetaAsync(item.ProviderIds, item.GetBaseItemKind().ToStremio())
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Asks for the meta under each of <paramref name="ids"/> until one answers. The addon's
+    /// manifest decides the order: an id whose prefix its meta resource declares goes first, so
+    /// the id the addon cannot serve is only ever tried as a fallback. Blanks and duplicates drop
+    /// out; the last id's failure is the caller's, as a single-id lookup's always was.
+    /// </summary>
+    private async Task<StremioMeta?> GetMetaAsync(
+        IEnumerable<string?> ids,
+        StremioMediaType mediaType,
+        TimeSpan? ttl = null
+    )
+    {
+        var candidates = ids.Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => id!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (candidates.Count == 0)
+            return null;
+
+        if (candidates.Count > 1)
+        {
+            var prefixes = await MetaIdPrefixesAsync(mediaType).ConfigureAwait(false);
+            if (prefixes.Count > 0)
+                candidates = candidates
+                    .OrderByDescending(id =>
+                        prefixes.Any(p => id.StartsWith(p, StringComparison.OrdinalIgnoreCase))
+                    )
+                    .ToList();
+        }
+
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            var last = i == candidates.Count - 1;
+            try
+            {
+                var meta = await GetMetaAsync(candidates[i], mediaType, ttl).ConfigureAwait(false);
+                if (meta is not null || last)
+                    return meta;
+            }
+            catch (Exception ex) when (!last)
+            {
+                log.LogWarning(
+                    ex,
+                    "GetMetaAsync: {Addon} cannot serve meta for {Id}",
+                    Redact.Url(baseUrl),
+                    candidates[i]
+                );
+            }
+
+            log.LogInformation(
+                "GetMetaAsync: no meta for {Id}, asking for {Fallback} instead",
+                candidates[i],
+                candidates[i + 1]
+            );
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The id prefixes the addon's meta resource declares for this type. Empty when the manifest
+    /// is unreachable or says nothing about them - the ids are then all tried in order.
+    /// </summary>
+    private async Task<List<string>> MetaIdPrefixesAsync(StremioMediaType mediaType)
+    {
+        var manifest = await GetManifestAsync().ConfigureAwait(false);
+        if (manifest is null)
+            return [];
+
+        var type = mediaType.ToString().ToLowerInvariant();
+        return manifest
+            .Resources.Where(r =>
+                string.Equals(r.Name, "meta", StringComparison.OrdinalIgnoreCase)
+                && (
+                    r.Types.Count == 0
+                    || r.Types.Any(t => string.Equals(t, type, StringComparison.OrdinalIgnoreCase))
+                )
+            )
+            .SelectMany(r => r.IdPrefixes)
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .ToList();
     }
 
     /// <summary>
@@ -232,11 +362,23 @@ public class GelatoStremioProvider(
         if (meta.App_Extras?.ReleaseDates is not null)
             return;
 
-        var tmdbId = meta.GetProviderIds().GetValueOrDefault(nameof(MetadataProvider.Tmdb));
-        if (string.IsNullOrWhiteSpace(tmdbId))
-            return;
-
+        var providerIds = meta.GetProviderIds();
         var apiKey = GetTmdbApiKey();
+        var tmdbId = providerIds.GetValueOrDefault(nameof(MetadataProvider.Tmdb));
+        if (string.IsNullOrWhiteSpace(tmdbId))
+        {
+            // An addon that reports no TMDB id of its own leaves only the imdb id the catalog
+            // keys on, so ask TMDB which movie that is.
+            var imdbId = providerIds.GetValueOrDefault(nameof(MetadataProvider.Imdb));
+            if (string.IsNullOrWhiteSpace(imdbId))
+                return;
+
+            tmdbId = await ResolveTmdbIdAsync(imdbId, apiKey, cancellationToken)
+                .ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(tmdbId))
+                return;
+        }
+
         var url =
             $"https://api.themoviedb.org/3/movie/{Uri.EscapeDataString(tmdbId)}/release_dates?api_key={apiKey}";
 
@@ -261,6 +403,46 @@ public class GelatoStremioProvider(
         {
             log.LogDebug(ex, "EnrichDigitalReleaseDate: failed for tmdb:{TmdbId}", tmdbId);
         }
+    }
+
+    /// <summary>
+    /// The TMDB movie id behind an IMDb id, through TMDB's find endpoint, or null when it cannot be
+    /// resolved. Answers are memoised for the process, negatives included, so a library full of
+    /// movies without a digital release date does not ask for the same id over and over.
+    /// </summary>
+    private async Task<string?> ResolveTmdbIdAsync(
+        string imdbId,
+        string apiKey,
+        CancellationToken cancellationToken
+    )
+    {
+        if (_tmdbIdByImdbId.TryGetValue(imdbId, out var cached))
+            return cached;
+
+        string? resolved = null;
+        try
+        {
+            using var client = http.CreateClient(nameof(GelatoStremioProvider));
+            client.Timeout = TimeSpan.FromSeconds(10);
+            var url =
+                $"https://api.themoviedb.org/3/find/{Uri.EscapeDataString(imdbId)}?api_key={apiKey}&external_source=imdb_id";
+            var response = await client
+                .GetStringAsync(url, cancellationToken)
+                .ConfigureAwait(false);
+            var id = JsonSerializer
+                .Deserialize<TmdbFindResponse>(response, JsonOpts)
+                ?.MovieResults?.FirstOrDefault()
+                ?.Id;
+            if (id is { } value)
+                resolved = value.ToString(CultureInfo.InvariantCulture);
+        }
+        catch (Exception ex)
+        {
+            log.LogDebug(ex, "ResolveTmdbId: failed for {ImdbId}", imdbId);
+        }
+
+        _tmdbIdByImdbId[imdbId] = resolved;
+        return resolved;
     }
 
     public async Task<List<StremioStream>> GetStreamsAsync(StremioUri uri)
@@ -487,6 +669,13 @@ public class StremioMeta
 
     [JsonPropertyName("imdb_id")]
     public string? ImdbId { get; set; }
+
+    [JsonPropertyName("_tmdbId")]
+    public string? TmdbIdExtra { get; set; }
+
+    [JsonPropertyName("_tvdbId")]
+    public string? TvdbIdExtra { get; set; }
+
     public DateTime? Released { get; set; }
 
     [JsonConverter(typeof(SafeStringEnumConverter<StremioStatus>))]
@@ -536,6 +725,18 @@ public class StremioMeta
     public Dictionary<string, string> GetProviderIds()
     {
         var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        // AIOStreams reports the ids it resolved next to the Stremio one. The Stremio id itself is
+        // an imdb id for almost every catalog, so without these the meta carries no TMDB id at all.
+        if (!string.IsNullOrWhiteSpace(TmdbIdExtra))
+        {
+            dict[nameof(MetadataProvider.Tmdb)] = TmdbIdExtra;
+        }
+
+        if (!string.IsNullOrWhiteSpace(TvdbIdExtra))
+        {
+            dict[nameof(MetadataProvider.Tvdb)] = TvdbIdExtra;
+        }
 
         if (!string.IsNullOrWhiteSpace(Id))
         {
@@ -646,9 +847,11 @@ public class StremioMeta
             if (digital.HasValue)
                 return digital.Value.AddDays(bufferDays) <= now;
 
-            // Old media without a digital release date — if premiered > 1 year ago, treat as released.
-            if (Released.HasValue && Released.Value < now.AddYears(-1))
-                return true;
+            // No digital release date: released only once the premiere is over a year old, the
+            // rule GelatoManager.IntoBaseItem writes into EndDate for the library listing filter.
+            // Falling through to the generic premiere check below made the addon search offer
+            // films that the library view hides.
+            return GetPremiereDate() is { } premiere && premiere < now.AddYears(-1);
         }
 
         if (Released.HasValue)
@@ -761,6 +964,17 @@ public class StremioAppExtras
 
     [JsonPropertyName("releaseDates")]
     public TmdbReleaseDatesContainer? ReleaseDates { get; set; }
+}
+
+public class TmdbFindResponse
+{
+    [JsonPropertyName("movie_results")]
+    public List<TmdbFindResult>? MovieResults { get; set; }
+}
+
+public class TmdbFindResult
+{
+    public int? Id { get; set; }
 }
 
 public class TmdbReleaseDatesContainer

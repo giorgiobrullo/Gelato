@@ -1,5 +1,6 @@
 using Gelato.Config;
 using Jellyfin.Data.Enums;
+using MediaBrowser.Common.Net;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Providers;
@@ -11,7 +12,8 @@ namespace Gelato.Providers;
 
 public sealed class GelatoMovieMetadataProvider(
     ILogger<GelatoMovieMetadataProvider> log,
-    GelatoManager manager
+    GelatoManager manager,
+    IHttpClientFactory http
 ) : IRemoteMetadataProvider<Movie, MovieInfo>, IHasOrder
 {
     public string Name => "Gelato";
@@ -38,11 +40,17 @@ public sealed class GelatoMovieMetadataProvider(
         StremioMeta? meta;
         try
         {
-            meta = await stremio.GetMetaAsync(id, StremioMediaType.Movie).ConfigureAwait(false);
+            meta = await stremio
+                .GetMetaAsync(info.ProviderIds, StremioMediaType.Movie)
+                .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            log.LogWarning(ex, "GelatoMovieMetadataProvider: failed to fetch meta for {Id}", id);
+            log.LogWarning(
+                ex,
+                "GelatoMovieMetadataProvider: failed to fetch meta for {Name}",
+                info.Name
+            );
             return result;
         }
 
@@ -55,6 +63,7 @@ public sealed class GelatoMovieMetadataProvider(
             return result;
 
         movie.ProviderIds.Remove("Stremio");
+        movie.KeepEndDateOnlyForGelato(info.ProviderIds);
         result.HasMetadata = true;
         result.Item = movie;
         MapPeople(meta, result);
@@ -91,7 +100,7 @@ public sealed class GelatoMovieMetadataProvider(
     public Task<HttpResponseMessage> GetImageResponse(
         string url,
         CancellationToken cancellationToken
-    ) => throw new NotImplementedException();
+    ) => http.CreateClient(NamedClient.Default).GetAsync(url, cancellationToken);
 
     private static void MapPeople(StremioMeta meta, MetadataResult<Movie> result)
     {
