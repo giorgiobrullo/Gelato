@@ -1711,6 +1711,8 @@ public class StremioSeasonPosters
 /// <summary>
 /// Reads <c>seasonPosters</c> as either the keyed object of AIOMetadata 3.0 or the legacy list.
 /// Anything else, or a key that is not a season number, is skipped.
+/// Skipping uses TrySkip: the meta is read from a stream, where Skip always throws even though the
+/// serializer has buffered the whole value for a custom converter.
 /// </summary>
 public sealed class SeasonPostersConverter : JsonConverter<StremioSeasonPosters?>
 {
@@ -1741,7 +1743,7 @@ public sealed class SeasonPostersConverter : JsonConverter<StremioSeasonPosters?
                     )
                         byNumber[n] = url;
                     else
-                        r.Skip();
+                        r.TrySkip();
                 }
                 return new StremioSeasonPosters { ByNumber = byNumber };
             case JsonTokenType.StartArray:
@@ -1749,11 +1751,11 @@ public sealed class SeasonPostersConverter : JsonConverter<StremioSeasonPosters?
                 while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                 {
                     ordered.Add(r.TokenType == JsonTokenType.String ? r.GetString() : null);
-                    r.Skip();
+                    r.TrySkip();
                 }
                 return new StremioSeasonPosters { Ordered = ordered };
             default:
-                r.Skip();
+                r.TrySkip();
                 return null;
         }
     }
@@ -2126,7 +2128,7 @@ public class SafeStringEnumConverter<T> : JsonConverter<T>
             if (reader.TryGetInt32(out var i) && Enum.IsDefined(typeof(T), i))
                 return (T)Enum.ToObject(typeof(T), i);
         }
-        reader.Skip();
+        reader.TrySkip();
         return Enum.TryParse<T>("Unknown", true, out var fb) ? fb : default;
     }
 
