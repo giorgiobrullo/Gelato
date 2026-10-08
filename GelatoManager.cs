@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Globalization;
 using Gelato.Config;
 using Gelato.Decorators;
+using Gelato.RemuxDb;
+using Gelato.Services;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Entities;
 using MediaBrowser.Common.Configuration;
@@ -27,12 +29,13 @@ public sealed class GelatoManager(
     IItemPersistenceService persistence,
     IFileSystem fileSystem,
     IMemoryCache memoryCache,
-    IServerConfigurationManager serverConfig,
     ILibraryManager libraryManager,
     IDirectoryService directoryService,
     IApplicationPaths appPaths,
     IUserManager userManager,
-    IUserDataManager userDataManager
+    IUserDataManager userDataManager,
+    RemuxDbService remuxDb,
+    ItemIdLookup idLookup
 )
 {
     public const string StreamTag = "gelato-stream";
@@ -50,12 +53,6 @@ public sealed class GelatoManager(
 
     private readonly ILogger<GelatoManager> _log = loggerFactory.CreateLogger<GelatoManager>();
 
-    private int GetHttpPort()
-    {
-        var networkConfig = serverConfig.GetNetworkConfiguration();
-        return networkConfig.InternalHttpPort;
-    }
-
     public void SetStremioSubtitlesCache(Guid guid, List<StremioSubtitle> subs)
     {
         memoryCache.Set($"subs:{guid}", subs, TimeSpan.FromMinutes(3600));
@@ -66,11 +63,15 @@ public sealed class GelatoManager(
         return memoryCache.Get<List<StremioSubtitle>>($"subs:{guid}");
     }
 
+    // Orders a stream sync and a reset. Not the wall clock: when it is set back between the two,
+    // a reset gets the older stamp and the sync before it counts as the newer one.
+    private static long _streamSyncSeq;
+
     public void SetStreamSync(string guid)
     {
         memoryCache.Set(
             $"streamsync:{guid}",
-            DateTime.UtcNow,
+            Interlocked.Increment(ref _streamSyncSeq),
             TimeSpan.FromSeconds(GelatoPlugin.Instance!.Configuration.StreamTTL)
         );
     }
@@ -81,10 +82,10 @@ public sealed class GelatoManager(
     /// </summary>
     public bool HasStreamSync(string guid, Guid itemId)
     {
-        if (!memoryCache.TryGetValue($"streamsync:{guid}", out DateTime syncedAt))
+        if (!memoryCache.TryGetValue($"streamsync:{guid}", out long syncedAt))
             return false;
 
-        return !memoryCache.TryGetValue($"streamsync-reset:{itemId}", out DateTime resetAt)
+        return !memoryCache.TryGetValue($"streamsync-reset:{itemId}", out long resetAt)
             || syncedAt > resetAt;
     }
 
@@ -96,14 +97,17 @@ public sealed class GelatoManager(
     {
         memoryCache.Set(
             $"streamsync-reset:{itemId}",
-            DateTime.UtcNow,
+            Interlocked.Increment(ref _streamSyncSeq),
             TimeSpan.FromSeconds(GelatoPlugin.Instance!.Configuration.StreamTTL)
         );
     }
 
+    /// <summary>How long a search result's meta is kept, and with it the poster it names.</summary>
+    public static readonly TimeSpan StremioMetaTtl = TimeSpan.FromHours(6);
+
     public void SaveStremioMeta(Guid guid, StremioMeta meta)
     {
-        memoryCache.Set($"meta:{guid}", meta, TimeSpan.FromMinutes(360));
+        memoryCache.Set($"meta:{guid}", meta, StremioMetaTtl);
     }
 
     public StremioMeta? GetStremioMeta(Guid guid)
@@ -149,6 +153,9 @@ public sealed class GelatoManager(
             cache.Compact(1.0);
         }
 
+        repo.ForgetUnreleasedIds();
+        RemuxDbClient.ForgetLookupsAhead();
+
         _log.LogDebug("Cache cleared");
     }
 
@@ -156,10 +163,21 @@ public sealed class GelatoManager(
     {
         Directory.CreateDirectory(path);
         var seed = Path.Combine(path, SeedFileName);
-        if (!File.Exists(seed))
+        if (File.Exists(seed))
         {
-            File.WriteAllText(seed, SeedFileContent);
+            return;
         }
+
+        // Two lookups can seed the same folder at once. CreateNew lets exactly one of them
+        // write; the other finds the file there, which is all it wanted. Checking and then
+        // writing let both write, and on Windows the loser failed on the winner's open handle.
+        try
+        {
+            using var stream = new FileStream(seed, FileMode.CreateNew, FileAccess.Write);
+            using var writer = new StreamWriter(stream);
+            writer.Write(SeedFileContent);
+        }
+        catch (IOException) when (File.Exists(seed)) { }
     }
 
     /// <summary>
@@ -238,6 +256,33 @@ public sealed class GelatoManager(
         return TryGetFolder(
             GelatoPlugin.Instance!.Configuration.GetEffectiveConfig(userId).SeriesPath
         );
+    }
+
+    /// <summary>
+    /// Whether the folder is what a scoped search is scoped to, or lies inside it. A request
+    /// without a parentId is scoped to nothing and takes everything.
+    /// </summary>
+    /// <remarks>
+    /// A client searching inside one library sends that library as parentId. The addon's answer
+    /// belongs to the library Gelato's folder is in: handing it to a search of another library
+    /// fills that library with titles it does not hold, and the items the results stand in for
+    /// are that other library's.
+    /// </remarks>
+    public bool IsWithinScope(Guid scope, BaseItem? folder)
+    {
+        if (scope.Equals(Guid.Empty))
+            return true;
+
+        if (folder is null)
+            return false;
+
+        if (folder.Id == scope)
+            return true;
+
+        if (libraryManager.GetCollectionFolders(folder).Any(f => f.Id == scope))
+            return true;
+
+        return folder.GetParents().Any(p => p.Id == scope);
     }
 
     public Folder? TryGetMovieFolder(PluginConfiguration cfg)
@@ -465,6 +510,59 @@ public sealed class GelatoManager(
         return (baseItem, true);
     }
 
+    /// <summary>
+    /// A played write on a series reaches its episodes, and it only has the ones that exist while it
+    /// runs: a series materialized by that very write is still growing, because the metadata refresh
+    /// is what brings the episodes the first pass did not have. Waiting for that refresh inside the
+    /// request took up to a minute on a long series, so the answer goes out first and the state is
+    /// applied again here, once the tree is complete. This runs the refresh the insert would have
+    /// queued, so the item is refreshed once either way.
+    /// </summary>
+    public void RefreshAndReapplyPlayedState(BaseItem item, User user, bool played)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var options = new MetadataRefreshOptions(new DirectoryService(fileSystem))
+                {
+                    MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                    ImageRefreshMode = MetadataRefreshMode.FullRefresh,
+                    ReplaceAllImages = false,
+                    ReplaceAllMetadata = false,
+                    ForceSave = true,
+                };
+                await provider
+                    .RefreshFullItem(item, options, CancellationToken.None)
+                    .ConfigureAwait(false);
+
+                var refreshed = libraryManager.GetItemById(item.Id) ?? item;
+                if (played)
+                {
+                    refreshed.MarkPlayed(user, DateTime.UtcNow, true);
+                }
+                else
+                {
+                    refreshed.MarkUnplayed(user);
+                }
+
+                _log.LogDebug(
+                    "played={Played} applied again to {Name} now that its tree is complete",
+                    played,
+                    refreshed.Name
+                );
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Could not apply the played state again to {Id} after its tree was built",
+                    item.Id
+                );
+            }
+        });
+    }
+
     private IEnumerable<BaseItem> FindByProviderIds(
         Dictionary<string, string> providerIds,
         BaseItemKind kind,
@@ -522,6 +620,39 @@ public sealed class GelatoManager(
         Func<CancellationToken, Task> action,
         CancellationToken ct
     ) => _itemWrites.RunQueuedAsync(itemId, action, ct);
+
+    /// <summary>
+    /// Asks for what the first stream sync of a movie waits for, the addon's streams and
+    /// RemuxDB's versions, while the movie is still a search result that is being put into the
+    /// library. <see cref="SyncStreams"/> then takes both answers instead of asking.
+    /// </summary>
+    /// <remarks>
+    /// Opening a movie from search asked the addon for the meta (2.0 to 2.5 s for a title's
+    /// first request) and, once the item was saved, for the streams (0.6 to 1.5 s), one after
+    /// the other. Only for a result that carries the id the sync will ask with: a movie is
+    /// synced under its IMDb id, and a result that has none (a <c>tmdb:</c> id alone) gets it
+    /// from the meta. A sync that asks with another id after all finds nothing to take and asks
+    /// for itself; the answer started here is dropped after 30 seconds.
+    /// </remarks>
+    public void StartStreamSyncAhead(StremioMeta result, Guid userId)
+    {
+        if (result.Type != StremioMediaType.Movie)
+            return;
+
+        // The id IntoBaseItem files as the movie's IMDb id, which StremioUri.FromBaseItem
+        // prefers.
+        var id = !string.IsNullOrWhiteSpace(result.ImdbId) ? result.ImdbId : result.Id;
+        if (
+            string.IsNullOrWhiteSpace(id)
+            || !id.StartsWith("tt", StringComparison.OrdinalIgnoreCase)
+            || GelatoPlugin.Instance!.GetConfig(userId).Stremio is not { } stremio
+        )
+            return;
+
+        var uri = new StremioUri(StremioMediaType.Movie, id);
+        stremio.StartStreamsAhead(uri);
+        remuxDb.LookupAhead(uri.ExternalId);
+    }
 
     /// <summary>
     /// Load streams and inserts them into the database keeping original
@@ -591,8 +722,10 @@ public sealed class GelatoManager(
 
         var cfg = GelatoPlugin.Instance!.GetConfig(userId);
         var stremio = cfg.Stremio;
+        // Next to the addon's request: RemuxDB answers in well under a second, and gives up after
+        // a few.
+        var remuxDbLookup = remuxDb.LookupAsync(uri.ExternalId, ct);
         var streams = await stremio.GetStreamsAsync(uri).ConfigureAwait(false);
-        var httpPort = GetHttpPort();
 
         // Filter valid streams
         var acceptable = streams
@@ -604,7 +737,7 @@ public sealed class GelatoManager(
                     return null;
                 }
 
-                if (!cfg.P2PEnabled && s.IsTorrent())
+                if (s.IsTorrent())
                 {
                     _log.LogDebug($"P2P stream, skipping {s.Name}");
                     return null;
@@ -681,20 +814,24 @@ public sealed class GelatoManager(
 
         var upsertedStreams = new List<Video>();
         var now = DateTime.UtcNow;
+        IReadOnlyList<RemuxDbVersion> remuxDbVersions;
+        try
+        {
+            remuxDbVersions = await remuxDbLookup.ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _log.LogWarning(ex, "RemuxDB lookup failed for {Id}", uri.ExternalId);
+            remuxDbVersions = [];
+        }
+        var libraryOptions = libraryManager.GetLibraryOptions(video);
+        var mediaInfo = new List<PendingMediaInfo>();
 
         for (var i = 0; i < acceptable.Count; i++)
         {
             var s = acceptable[i];
             var index = i + 1;
-            var path = s.IsFile()
-                ? s.Url
-                : $"http://127.0.0.1:{httpPort}/gelato/stream?ih={s.InfoHash}"
-                    + (s.FileIdx is not null ? $"&idx={s.FileIdx}" : "")
-                    + (
-                        s.Sources is { Count: > 0 }
-                            ? $"&trackers={Uri.EscapeDataString(string.Join(',', s.Sources))}"
-                            : ""
-                    );
+            var path = s.Url;
 
             var streamGuid = s.GetGuid();
             var isNewStreamItem = !existingByGuid.TryGetValue(streamGuid, out var streamItem);
@@ -738,7 +875,9 @@ public sealed class GelatoManager(
             streamItem.LockedFields = locked.ToArray();
 
             streamItem.ProviderIds = streamProviderIds;
-            streamItem.RunTimeTicks = video.RunTimeTicks ?? video.RunTimeTicks;
+            // A row with media info keeps the runtime of its file.
+            if (streamItem.GelatoData<string>("mediaInfo") is null)
+                streamItem.RunTimeTicks = video.RunTimeTicks;
             streamItem.LinkedAlternateVersions = [];
             streamItem.SetPrimaryVersionId(video.Id);
             CopyVersionMetadata(video, streamItem);
@@ -765,6 +904,27 @@ public sealed class GelatoManager(
             }
             streamItem.SetGelatoData("index", index);
             streamItem.SetGelatoData("guid", streamGuid);
+            try
+            {
+                if (
+                    remuxDb.Apply(
+                        streamItem,
+                        isNewStreamItem,
+                        s.GetIdentity(),
+                        remuxDbVersions,
+                        video,
+                        libraryOptions
+                    )
+                    is { } info
+                )
+                {
+                    mediaInfo.Add(info);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "RemuxDB media info failed for stream {Guid}", streamGuid);
+            }
             // Keep map current so stale detection below uses the final upserted set.
             existingByGuid[streamGuid] = streamItem;
 
@@ -778,8 +938,15 @@ public sealed class GelatoManager(
             upsertedStreams.Add(streamItem);
         }
 
-        //upsertedStreams = SaveItems(upsertedStreams, (Folder)primary.GetParent()).Cast<Video>().ToList();
         persistence.SaveItems(upsertedStreams, ct);
+        try
+        {
+            remuxDb.Save(mediaInfo, ct);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _log.LogWarning(ex, "Saving RemuxDB media info failed for {Id}", uri.ExternalId);
+        }
 
         var newIds = new HashSet<Guid>(upsertedStreams.Select(x => x.Id));
         var stale = existingByGuid
@@ -850,7 +1017,12 @@ public sealed class GelatoManager(
         stopwatch.Stop();
 
         _log.LogInformation(
-            $"SyncStreams finished GelatoId={uri.ExternalId} userId={userId} duration={Math.Round(stopwatch.Elapsed.TotalSeconds, 1)}s streams={upsertedStreams.Count}"
+            "SyncStreams finished GelatoId={GelatoId} userId={UserId} duration={Duration}s streams={Count} remuxdb={RemuxDb}",
+            uri.ExternalId,
+            userId,
+            Math.Round(stopwatch.Elapsed.TotalSeconds, 1).ToString(CultureInfo.InvariantCulture),
+            acceptable.Count,
+            mediaInfo.Count
         );
 
         return acceptable.Count;
@@ -956,9 +1128,14 @@ public sealed class GelatoManager(
         if (primary.GetProviderId("Stremio") is not { Length: > 0 } stremioId)
             return false;
 
+        var ids = idLookup.WithProviderId("Stremio", stremioId);
+        if (ids.Length == 0)
+            return false;
+
         var owned = repo.GetItemList(
                 new InternalItemsQuery
                 {
+                    ItemIds = ids,
                     IncludeItemTypes = [primary.GetBaseItemKind()],
                     HasAnyProviderId = new Dictionary<string, string> { { "Stremio", stremioId } },
                     Tags = [StreamTag],
@@ -989,11 +1166,15 @@ public sealed class GelatoManager(
             .Where(v => v.HasStreamTag())
             .ToList();
 
-        if (primary.GetProviderId("Stremio") is { Length: > 0 } stremioId)
+        if (
+            primary.GetProviderId("Stremio") is { Length: > 0 } stremioId
+            && idLookup.WithProviderId("Stremio", stremioId) is { Length: > 0 } ids
+        )
         {
             var unlinked = repo.GetItemList(
                     new InternalItemsQuery
                     {
+                        ItemIds = ids,
                         IncludeItemTypes = [primary.GetBaseItemKind()],
                         HasAnyProviderId = new Dictionary<string, string>
                         {
@@ -1040,15 +1221,13 @@ public sealed class GelatoManager(
         // Deleted items park their user data under their keys, which rows share with the movie.
         ForgetWatchState(rows, ct);
 
+        var deleted = 0;
         foreach (var row in rows)
         {
             try
             {
-                libraryManager.DeleteItem(
-                    row,
-                    new DeleteOptions { DeleteFileLocation = false },
-                    false
-                );
+                DeleteStreamRow(row, new DeleteOptions { DeleteFileLocation = false }, false);
+                deleted++;
             }
             catch (Exception ex)
             {
@@ -1056,7 +1235,33 @@ public sealed class GelatoManager(
             }
         }
 
-        _log.LogDebug("Deleted {Count} stream(s) of {Id}", rows.Count, primary.Id);
+        _log.LogDebug(
+            "Deleted {Count} of {Total} stream(s) of {Id}",
+            deleted,
+            rows.Count,
+            primary.Id
+        );
+    }
+
+    /// <summary>
+    /// Deletes a stream row through Jellyfin, which logs every removed item's path at
+    /// Information. A row's path is the stream URL, and a debrid addon's URL carries the API key,
+    /// so Jellyfin is handed the redacted one. It only decides whether a file is deleted, which a
+    /// URL never is. The path goes back if the delete fails: the cached item is this object.
+    /// </summary>
+    public void DeleteStreamRow(Video row, DeleteOptions options, bool notifyParentItem)
+    {
+        var path = row.Path;
+        row.Path = Redact.Url(path);
+        try
+        {
+            libraryManager.DeleteItem(row, options, notifyParentItem);
+        }
+        catch
+        {
+            row.Path = path;
+            throw;
+        }
     }
 
     /// <summary>
@@ -1139,7 +1344,7 @@ public sealed class GelatoManager(
                     CancellationToken.None
                 );
                 _log.LogDebug(
-                    "Adopted the watch state of a legacy stream row for {Name} on {Id}",
+                    "Adopted the watch state of a replaced item for {Name} on {Id}",
                     user.Username,
                     primary.Id
                 );
@@ -1240,6 +1445,92 @@ public sealed class GelatoManager(
             .Any(s => s.IsGelato());
 
     /// <summary>
+    /// Whether Jellyfin is scanning the series, or a folder above it, right now.
+    /// </summary>
+    /// <remarks>
+    /// A scan saves what it finds before it refreshes it: a new series is listed while its
+    /// episodes are not created yet, and a new episode has no season and episode number until its
+    /// own refresh, seconds later. A tree extended in between takes every slot of the series for
+    /// empty and fills the ones the files are about to hold.
+    /// </remarks>
+    public bool IsBeingScanned(Series series) =>
+        provider.GetRefreshProgress(series.Id) is not null
+        || series.GetParents().Any(p => provider.GetRefreshProgress(p.Id) is not null);
+
+    /// <summary>
+    /// Takes back the episodes Gelato added to a local series for a slot one of the series' own
+    /// episodes holds, so the episode is listed once: as the file.
+    /// </summary>
+    /// <remarks>
+    /// Gelato fills the slots a local series has no file for, and a file can arrive afterwards:
+    /// the user adds the episode, or the tree was extended while the scan had not numbered the
+    /// file yet. Nothing removed Gelato's episode then, and the season listed both from then on.
+    /// What was watched on Gelato's episode moves to the file, unless the file's state is newer,
+    /// and so do playlist and collection entries.
+    /// </remarks>
+    public void RemoveShadowedEpisodes(Series series, CancellationToken ct)
+    {
+        var slots = libraryManager
+            .GetItemList(
+                new InternalItemsQuery
+                {
+                    AncestorIds = [series.Id],
+                    IncludeItemTypes = [BaseItemKind.Episode],
+                    Recursive = true,
+                    IsDeadPerson = true,
+                }
+            )
+            .OfType<Episode>()
+            .Where(e => !e.IsStream() && e.IndexNumber.HasValue && e.ParentIndexNumber.HasValue)
+            .GroupBy(e => (e.ParentIndexNumber, e.IndexNumber));
+
+        foreach (var slot in slots)
+        {
+            var shadowed = slot.Where(e => e.IsGelato() && !e.IsFileProtocol).ToList();
+            if (
+                shadowed.Count == 0
+                || slot.FirstOrDefault(e => e.IsFileProtocol && !e.IsGelato()) is not { } file
+            )
+                continue;
+
+            // The library manager's copy where it has one: these came fresh from the database,
+            // and watch state saved on another copy is not seen through the cached one.
+            var local = libraryManager.GetItemById(file.Id) as Episode ?? file;
+
+            foreach (var added in shadowed)
+            {
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    DeleteStreamRows(added, GetStreamRows(added), ct);
+                    AdoptWatchState(local, [added]);
+                    RerouteLinks([added], local.Id);
+                    libraryManager.DeleteItem(
+                        added,
+                        new DeleteOptions { DeleteFileLocation = false }
+                    );
+                    _log.LogDebug(
+                        "Removed S{Season:D2}E{Episode:D2} from {SeriesName}: the series has a file for it",
+                        added.ParentIndexNumber,
+                        added.IndexNumber,
+                        series.Name
+                    );
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError(
+                        ex,
+                        "Failed to remove episode {Name} ({Id}) a file of {SeriesName} replaces",
+                        added.Name,
+                        added.Id,
+                        series.Name
+                    );
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// The item the tree sync would overwrite by creating one at <paramref name="path"/>, if there
     /// is one: every Gelato item takes its id from the hash of its path
     /// (<see cref="ILibraryManager.GetNewItemId"/>), so two items at the same path are one row.
@@ -1263,6 +1554,7 @@ public sealed class GelatoManager(
         {
             // Local (non-gelato) series — use as-is, no creation needed
             series = existingSeries;
+            RemoveShadowedEpisodes(series, ct);
         }
         else
         {
@@ -1474,7 +1766,10 @@ public sealed class GelatoManager(
                     ParentId = series.Id,
                 };
 
-                var primary = seriesMeta.App_Extras?.SeasonPosters?.ElementAtOrDefault(seasonIndex);
+                var primary = seriesMeta.App_Extras?.GetSeasonPoster(
+                    seasonIndex,
+                    seriesMeta.Videos
+                );
                 if (!string.IsNullOrWhiteSpace(primary))
                 {
                     ProviderManagerDecorator.SetRemoteImage(
@@ -1858,7 +2153,7 @@ public sealed class GelatoManager(
                                         await EnrichMetaAsync(meta, ct).ConfigureAwait(false);
                                         var digital = meta.GetDigitalReleaseDate();
                                         var oneYearAgo = DateTime.UtcNow.AddYears(-1);
-                                        movie.EndDate =
+                                        var endDate =
                                             digital
                                             ?? (
                                                 movie.PremiereDate.HasValue
@@ -1866,6 +2161,9 @@ public sealed class GelatoManager(
                                                     ? movie.PremiereDate.Value
                                                     : sentinel
                                             );
+                                        if (movie.EndDate == endDate)
+                                            break;
+                                        movie.EndDate = endDate;
                                         chunkResults.Add(movie);
                                         _log.LogDebug(
                                             "SyncReleaseDates: movie {Name} EndDate → {Date}",
@@ -1879,9 +2177,14 @@ public sealed class GelatoManager(
                                     }
 
                                 case BaseItem other when other is Series or Season or Episode:
-                                    other.EndDate = other.PremiereDate ?? sentinel;
-                                    chunkResults.Add(other);
-                                    break;
+                                    {
+                                        var endDate = other.PremiereDate ?? sentinel;
+                                        if (other.EndDate == endDate)
+                                            break;
+                                        other.EndDate = endDate;
+                                        chunkResults.Add(other);
+                                        break;
+                                    }
                             }
                         }
                         catch (Exception ex)
@@ -1911,8 +2214,10 @@ public sealed class GelatoManager(
             }
         }
 
+        // Unreleased items are checked again on every run, so most of them keep their date.
         _log.LogInformation(
-            "SyncReleaseDates completed. EndDate fixed for {Count} item(s).",
+            "SyncReleaseDates completed. Checked {Total} unreleased item(s), EndDate changed for {Count}.",
+            total,
             totalSaved
         );
     }
@@ -1974,6 +2279,8 @@ public sealed class GelatoManager(
 
         var total = continuingSeries.Count;
         var i = 0;
+        var failed = 0;
+        var noMeta = 0;
 
         await Parallel.ForEachAsync(
             continuingSeries,
@@ -1987,7 +2294,9 @@ public sealed class GelatoManager(
                 try
                 {
                     var meta = await stremio.GetMetaAsync(series).ConfigureAwait(false);
-                    if (meta is not null)
+                    if (meta is null)
+                        Interlocked.Increment(ref noMeta);
+                    else
                     {
                         var isLocal = !series.IsGelato();
                         await SyncSeriesTreesAsync(
@@ -2001,6 +2310,7 @@ public sealed class GelatoManager(
                 }
                 catch (Exception ex)
                 {
+                    Interlocked.Increment(ref failed);
                     _log.LogError(
                         ex,
                         "SyncSeriesTrees: tree sync failed for {Name} ({Id})",
@@ -2017,8 +2327,10 @@ public sealed class GelatoManager(
         );
 
         _log.LogInformation(
-            "SyncSeriesTrees: continuing series synced: {SeriesCount}.",
-            continuingSeries.Count
+            "SyncSeriesTrees: continuing series synced: {SeriesCount}, no meta: {NoMeta}, failed: {Failed}.",
+            continuingSeries.Count - noMeta - failed,
+            noMeta,
+            failed
         );
 
         if (cfg.ExtendLocalSeriesTrees)
@@ -2051,14 +2363,28 @@ public sealed class GelatoManager(
                     !string.IsNullOrWhiteSpace(s.GetProviderId("Imdb"))
                     || !string.IsNullOrWhiteSpace(s.GetProviderId("Tmdb"))
                 )
-                && !HasExtendedTree(s)
             )
             .ToList();
 
+        // A series that has its tree is not synced again, but a file can have arrived for a slot
+        // Gelato filled.
+        var extendedSeries = localSeries.Where(HasExtendedTree).ToList();
+        foreach (var series in extendedSeries)
+        {
+            ct.ThrowIfCancellationRequested();
+            RemoveShadowedEpisodes(series, ct);
+        }
+
+        localSeries = localSeries.Except(extendedSeries).ToList();
+
+        // Not only new ones: a series whose tree is being rebuilt, or that only had episodes
+        // filled in, is not marked yet and comes back on every run.
         _log.LogInformation(
-            "SyncSeriesTrees: {Count} local (non-gelato, non-continuing) series to extend for the first time.",
+            "SyncSeriesTrees: {Count} local (non-gelato, non-continuing) series without an extended tree to check.",
             localSeries.Count
         );
+        var extended = 0;
+        var failed = 0;
 
         var total = progressTotal + localSeries.Count;
         var i = progressOffset;
@@ -2073,6 +2399,7 @@ public sealed class GelatoManager(
                 {
                     await SyncSeriesTreesAsync(cfg, meta, ct, existingSeries: series)
                         .ConfigureAwait(false);
+                    extended++;
 
                     // Mark as synced so we skip on future runs. A series whose tree was rebuilt
                     // after it lost its seasons carries the mark already; adding it twice would
@@ -2095,6 +2422,7 @@ public sealed class GelatoManager(
             }
             catch (Exception ex)
             {
+                failed++;
                 _log.LogError(
                     ex,
                     "SyncSeriesTrees: virtual tree sync failed for {Name} ({Id})",
@@ -2108,6 +2436,14 @@ public sealed class GelatoManager(
                     progress?.Report(100.0 * ++i / total);
             }
         }
+
+        if (localSeries.Count > 0)
+            _log.LogInformation(
+                "SyncSeriesTrees: local series extended: {Extended}, no meta: {NoMeta}, failed: {Failed}.",
+                extended,
+                localSeries.Count - extended - failed,
+                failed
+            );
     }
 
     public void CleanVirtualTreeItem(Series series, CancellationToken ct)

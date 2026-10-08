@@ -185,6 +185,30 @@
               <div class="fieldDescription">Cache duration for external stream URLs.</div>
             </div>
 
+            <div class="checkboxContainer checkboxContainer-withDescription">
+              <label>
+                <input is="emby-checkbox" type="checkbox" id="chkPreProbe" />
+                <span>Probe streams before playback</span>
+              </label>
+              <div class="fieldDescription">Probes a stream when you open its page or pick another version, and the next episode while one is ending, so playback starts without waiting for the probe.</div>
+            </div>
+
+            <h3 class="sectionTitle">RemuxDB</h3>
+            <div class="checkboxContainer checkboxContainer-withDescription">
+              <label>
+                <input is="emby-checkbox" type="checkbox" id="chkRemuxDbEnabled" />
+                <span>Look up media info on RemuxDB</span>
+              </label>
+              <div class="fieldDescription">Shows audio, subtitles and quality of a stream before you play it, and starts playback faster.</div>
+            </div>
+            <div class="checkboxContainer checkboxContainer-withDescription">
+              <label>
+                <input is="emby-checkbox" type="checkbox" id="chkRemuxDbContribute" />
+                <span>Contribute to RemuxDB</span>
+              </label>
+              <div class="fieldDescription">Shares this info for streams you play, so others see it too. Anonymous: no links, accounts or personal data.</div>
+            </div>
+
           </div>
 
           <!-- User Configs Tab -->
@@ -300,6 +324,9 @@
         const txtFFmpegProbeSize = page.querySelector('#txtFFmpegProbeSize');
         const chkEnableJavaScriptInjection = page.querySelector('#chkEnableJavaScriptInjection');
         const chkLazyImages = page.querySelector('#chkLazyImages');
+        const chkPreProbe = page.querySelector('#chkPreProbe');
+        const chkRemuxDbEnabled = page.querySelector('#chkRemuxDbEnabled');
+        const chkRemuxDbContribute = page.querySelector('#chkRemuxDbContribute');
 
         // Catalogs
         const catalogsList = page.querySelector('#catalogsList');
@@ -594,6 +621,9 @@
             if (txtFFmpegProbeSize) txtFFmpegProbeSize.value = cfg.FFmpegProbeSize || "25M";
             if (chkEnableJavaScriptInjection) chkEnableJavaScriptInjection.checked = cfg.EnableJavaScriptInjection || false;
             if (chkLazyImages) chkLazyImages.checked = cfg.LazyImages ?? false;
+            if (chkPreProbe) chkPreProbe.checked = cfg.PreProbe ?? true;
+            if (chkRemuxDbEnabled) chkRemuxDbEnabled.checked = cfg.RemuxDbEnabled ?? true;
+            if (chkRemuxDbContribute) chkRemuxDbContribute.checked = cfg.RemuxDbContribute ?? true;
 
             // User Overrides — API returns an array, convert to object keyed by UserId
             const userConfigsArray = cfg.UserConfigs || [];
@@ -640,6 +670,9 @@
             cfg.FFmpegProbeSize = txtFFmpegProbeSize.value;
             cfg.EnableJavaScriptInjection = chkEnableJavaScriptInjection.checked;
             cfg.LazyImages = chkLazyImages.checked;
+            cfg.PreProbe = chkPreProbe.checked;
+            cfg.RemuxDbEnabled = chkRemuxDbEnabled.checked;
+            cfg.RemuxDbContribute = chkRemuxDbContribute.checked;
 
             // Only collect catalog states if catalogs have been loaded (i.e., if we're on catalogs tab or it was loaded)
             if (allCatalogs.length > 0) {

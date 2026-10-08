@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using MediaBrowser.Controller.Entities;
@@ -40,10 +41,24 @@ public class GelatoStremioProvider(
         return null;
     }
 
+    private const string AioStreamsUserAgent = "AIOStreams/1.0";
+
+    /// <summary>
+    /// Whether the addon is AIOStreams. Instances can rebrand the manifest id
+    /// (<c>com.aiostreams.viren070</c> by default) and name, but keep the product in one of them.
+    /// </summary>
+    private static bool IsAioStreams(StremioManifest? manifest) =>
+        manifest is not null
+        && (
+            manifest.Id.Contains("aiostreams", StringComparison.OrdinalIgnoreCase)
+            || manifest.Name.Contains("aiostreams", StringComparison.OrdinalIgnoreCase)
+        );
+
     private HttpClient NewClient()
     {
         var c = http.CreateClient(nameof(GelatoStremioProvider));
         c.Timeout = TimeSpan.FromSeconds(30);
+        c.DefaultRequestHeaders.UserAgent.TryParseAdd(GelatoPlugin.UserAgent);
         return c;
     }
 
@@ -64,7 +79,7 @@ public class GelatoStremioProvider(
         return url;
     }
 
-    private async Task<T?> GetJsonAsync<T>(string url)
+    private async Task<T?> GetJsonAsync<T>(string url, string? userAgent = null)
     {
         // The base URL carries the user's addon config, so only the resource after it is logged.
         var resource = url.StartsWith(baseUrl, StringComparison.Ordinal)
@@ -79,7 +94,10 @@ public class GelatoStremioProvider(
         try
         {
             var c = NewClient();
-            var resp = await c.GetAsync(url).ConfigureAwait(false); // No using statement
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            if (userAgent is not null)
+                request.Headers.UserAgent.ParseAdd(userAgent);
+            var resp = await c.SendAsync(request).ConfigureAwait(false); // No using statement
 
             if (!resp.IsSuccessStatusCode)
             {
@@ -100,7 +118,8 @@ public class GelatoStremioProvider(
             await using var s = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
             return await JsonSerializer.DeserializeAsync<T>(s, JsonOpts).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        // A non-success status was logged above; the exception only carries it to the caller.
+        catch (Exception ex) when (ex is not HttpRequestException { StatusCode: not null })
         {
             log.LogError(
                 ex,
@@ -208,6 +227,51 @@ public class GelatoStremioProvider(
         return await GetMetaAsync([meta.ImdbId, meta.Id], meta.Type, ttl).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// The addon meta ids an item's provider ids stand for, best first: the IMDb and TMDB ids
+    /// every catalog keys on, then the addon's own id and the ids <see cref="GelatoManager.IntoBaseItem"/>
+    /// writes for the namespaces an anime addon hands out.
+    /// </summary>
+    /// <remarks>
+    /// Only IMDb and TMDB used to be looked at, so an item carrying neither could never have its
+    /// meta fetched again: the tree sync and the series page both gave up on it ("has no imdb and
+    /// tmdb ID"), and the seasons it was created with were all it ever got (lostb1t/Gelato#225).
+    /// Anime is where that happens - the catalogs hand out <c>kitsu:</c>, <c>mal:</c>,
+    /// <c>anilist:</c> and <c>anidb:</c> ids, and plenty of titles have no IMDb or TMDB id at all -
+    /// while playback kept working, because <see cref="StremioUri.FromBaseItem"/> has always fallen
+    /// back to the addon's own id.
+    /// </remarks>
+    private static IEnumerable<string?> MetaIdCandidates(
+        IReadOnlyDictionary<string, string> providerIds
+    )
+    {
+        string? Id(string provider, string prefix = "")
+        {
+            return
+                providerIds.TryGetValue(provider, out var value)
+                && !string.IsNullOrWhiteSpace(value)
+                ? prefix + value
+                : null;
+        }
+
+        yield return Id(nameof(MetadataProvider.Imdb));
+        yield return Id(nameof(MetadataProvider.Tmdb), "tmdb:");
+        // The id the addon itself gave the item, already in the addon's own format.
+        yield return Id("Stremio");
+        yield return Id("Kitsu", "kitsu:");
+        yield return Id("Mal", "mal:");
+        yield return Id("Anilist", "anilist:");
+        yield return Id("AniDB", "anidb:");
+        yield return Id(nameof(MetadataProvider.Tvdb), "tvdb:");
+        yield return Id(nameof(MetadataProvider.TvMaze), "tvmaze:");
+    }
+
+    /// <summary>
+    /// Whether those provider ids name anything the addon's meta resource could be asked for.
+    /// </summary>
+    public static bool HasMetaId(IReadOnlyDictionary<string, string> providerIds) =>
+        MetaIdCandidates(providerIds).Any(id => !string.IsNullOrWhiteSpace(id));
+
     /// <inheritdoc cref="GetMetaAsync(StremioMeta, TimeSpan?)"/>
     public async Task<StremioMeta?> GetMetaAsync(
         IReadOnlyDictionary<string, string> providerIds,
@@ -215,25 +279,19 @@ public class GelatoStremioProvider(
         TimeSpan? ttl = null
     )
     {
-        providerIds.TryGetValue(nameof(MetadataProvider.Imdb), out var imdbId);
-        providerIds.TryGetValue(nameof(MetadataProvider.Tmdb), out var tmdbId);
-        return await GetMetaAsync(
-                [imdbId, string.IsNullOrWhiteSpace(tmdbId) ? null : $"tmdb:{tmdbId}"],
-                mediaType,
-                ttl
-            )
+        return await GetMetaAsync(MetaIdCandidates(providerIds), mediaType, ttl)
             .ConfigureAwait(false);
     }
 
     public async Task<StremioMeta?> GetMetaAsync(BaseItem item)
     {
-        var imdbId = item.GetProviderId("Imdb");
-        var tmdbId = item.GetProviderId("Tmdb");
-        if (imdbId is null)
-            log.LogWarning("GetMetaAsync: {Name} has no imdb ID", item.Name);
-        if (imdbId is null && tmdbId is null)
+        // Not a failure: the meta is looked up under the item's other ids too.
+        if (item.GetProviderId("Imdb") is null)
+            log.LogDebug("GetMetaAsync: {Name} has no imdb ID", item.Name);
+
+        if (!HasMetaId(item.ProviderIds))
         {
-            log.LogWarning("GetMetaAsync: {Name} has no imdb and tmdb ID", item.Name);
+            log.LogWarning("GetMetaAsync: {Name} has no id the addon could serve", item.Name);
             return null;
         }
 
@@ -283,7 +341,8 @@ public class GelatoStremioProvider(
             }
             catch (Exception ex) when (!last)
             {
-                log.LogWarning(
+                // The line below says a fallback follows; the exception is for debugging.
+                log.LogDebug(
                     ex,
                     "GetMetaAsync: {Addon} cannot serve meta for {Id}",
                     Redact.Url(baseUrl),
@@ -368,13 +427,19 @@ public class GelatoStremioProvider(
         if (string.IsNullOrWhiteSpace(tmdbId))
         {
             // An addon that reports no TMDB id of its own leaves only the imdb id the catalog
-            // keys on, so ask TMDB which movie that is.
+            // keys on. TMDB's movie details take that id, so one request answers both which
+            // movie it is and its release dates; /find and then /release_dates took two round
+            // trips, 0.3 s each, on every movie opened from search.
             var imdbId = providerIds.GetValueOrDefault(nameof(MetadataProvider.Imdb));
             if (string.IsNullOrWhiteSpace(imdbId))
                 return;
 
-            tmdbId = await ResolveTmdbIdAsync(imdbId, apiKey, cancellationToken)
-                .ConfigureAwait(false);
+            if (!_tmdbIdByImdbId.TryGetValue(imdbId, out tmdbId))
+            {
+                await EnrichByImdbIdAsync(meta, imdbId, apiKey, cancellationToken)
+                    .ConfigureAwait(false);
+                return;
+            }
             if (string.IsNullOrWhiteSpace(tmdbId))
                 return;
         }
@@ -399,6 +464,19 @@ public class GelatoStremioProvider(
                 meta.App_Extras.ReleaseDates = container;
             }
         }
+        // TMDB answering with an error is not transient: an addon that maps the movie to a TMDB id
+        // TMDB does not have leaves it without a digital release date on every run, so it stays
+        // unreleased for good.
+        catch (HttpRequestException ex) when (ex.StatusCode is not null)
+        {
+            log.LogWarning(
+                "EnrichDigitalReleaseDate: TMDB answered {Status} for tmdb:{TmdbId} ({Name}, {Id}), no digital release date",
+                (int)ex.StatusCode,
+                tmdbId,
+                meta.Name,
+                meta.Id
+            );
+        }
         catch (Exception ex)
         {
             log.LogDebug(ex, "EnrichDigitalReleaseDate: failed for tmdb:{TmdbId}", tmdbId);
@@ -406,54 +484,114 @@ public class GelatoStremioProvider(
     }
 
     /// <summary>
-    /// The TMDB movie id behind an IMDb id, through TMDB's find endpoint, or null when it cannot be
-    /// resolved. Answers are memoised for the process, negatives included, so a library full of
-    /// movies without a digital release date does not ask for the same id over and over.
+    /// Sets the release dates of the movie TMDB knows under <paramref name="imdbId"/>, and
+    /// memoises its TMDB id. A movie TMDB does not know (404) is memoised as null, so a library
+    /// full of movies without a digital release date does not ask for the same id over and over.
     /// </summary>
-    private async Task<string?> ResolveTmdbIdAsync(
+    private async Task EnrichByImdbIdAsync(
+        StremioMeta meta,
         string imdbId,
         string apiKey,
         CancellationToken cancellationToken
     )
     {
-        if (_tmdbIdByImdbId.TryGetValue(imdbId, out var cached))
-            return cached;
-
-        string? resolved = null;
         try
         {
             using var client = http.CreateClient(nameof(GelatoStremioProvider));
             client.Timeout = TimeSpan.FromSeconds(10);
             var url =
-                $"https://api.themoviedb.org/3/find/{Uri.EscapeDataString(imdbId)}?api_key={apiKey}&external_source=imdb_id";
+                $"https://api.themoviedb.org/3/movie/{Uri.EscapeDataString(imdbId)}?api_key={apiKey}&append_to_response=release_dates";
             var response = await client
                 .GetStringAsync(url, cancellationToken)
                 .ConfigureAwait(false);
-            var id = JsonSerializer
-                .Deserialize<TmdbFindResponse>(response, JsonOpts)
-                ?.MovieResults?.FirstOrDefault()
-                ?.Id;
-            if (id is { } value)
-                resolved = value.ToString(CultureInfo.InvariantCulture);
+            var movie = JsonSerializer.Deserialize<TmdbMovieReleaseDates>(response, JsonOpts);
+            _tmdbIdByImdbId[imdbId] = movie?.Id?.ToString(CultureInfo.InvariantCulture);
+            if (movie?.ReleaseDates is { } container)
+            {
+                meta.App_Extras ??= new StremioAppExtras();
+                meta.App_Extras.ReleaseDates = container;
+            }
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            _tmdbIdByImdbId[imdbId] = null;
         }
         catch (Exception ex)
         {
-            log.LogDebug(ex, "ResolveTmdbId: failed for {ImdbId}", imdbId);
+            log.LogDebug(ex, "EnrichDigitalReleaseDate: failed for {ImdbId}", imdbId);
         }
-
-        _tmdbIdByImdbId[imdbId] = resolved;
-        return resolved;
     }
+
+    /// <summary>
+    /// How long a stream answer asked for ahead waits to be taken. The addon's own timeout: an
+    /// answer that took longer than that is not coming.
+    /// </summary>
+    private static readonly TimeSpan StreamsAheadLifetime = TimeSpan.FromSeconds(30);
+
+    private AheadOfTime<List<StremioStream>>? _streamsAhead;
+
+    // A request that nobody took was one too many: it is logged, so that it can be counted.
+    private AheadOfTime<List<StremioStream>> StreamsAhead =>
+        LazyInitializer.EnsureInitialized(
+            ref _streamsAhead,
+            () =>
+                new AheadOfTime<List<StremioStream>>(
+                    StreamsAheadLifetime,
+                    key =>
+                        log.LogDebug(
+                            "StartStreamsAhead: nobody took the streams asked for ahead for {Key}",
+                            key
+                        )
+                )
+        );
+
+    private static string StreamsKey(StremioUri uri) => $"{uri.MediaType}:{uri.ExternalId}";
+
+    /// <summary>
+    /// Asks for a title's streams before anything needs them, for the next
+    /// <see cref="GetStreamsAsync(StremioUri)"/> of the same title to take. Whoever knows that a
+    /// stream sync is about to follow calls this: the answer is the addon's slowest (0.6 to
+    /// 1.5 s), and it does not depend on what the caller does in between.
+    /// </summary>
+    public void StartStreamsAhead(StremioUri uri) =>
+        StreamsAhead.Start(
+            StreamsKey(uri),
+            () =>
+            {
+                log.LogDebug(
+                    "StartStreamsAhead: asking for the streams of {Id} ahead of their sync",
+                    uri.ExternalId
+                );
+                return GetStreamsAsync(uri.ExternalId, uri.MediaType);
+            }
+        );
 
     public async Task<List<StremioStream>> GetStreamsAsync(StremioUri uri)
     {
+        if (StreamsAhead.TryTake(StreamsKey(uri)) is { } ahead)
+        {
+            log.LogDebug(
+                "GetStreamsAsync: taking the answer asked for ahead for {Id}",
+                uri.ExternalId
+            );
+            return await ahead.ConfigureAwait(false);
+        }
+
         return await GetStreamsAsync(uri.ExternalId, uri.MediaType);
     }
 
     private async Task<List<StremioStream>> GetStreamsAsync(string id, StremioMediaType mediaType)
     {
         var url = BuildUrl(["stream", mediaType.ToString().ToLower(), id]);
-        var r = await GetJsonAsync<StremioStreamsResponse>(url);
+        // AIOStreams only adds its stream data (the torrent's info hash, the file's size) for
+        // requests it takes for another AIOStreams, told by the User-Agent. RemuxDB needs the
+        // hash to match and accept a file; Remux asks the same way. Other addons keep getting
+        // Gelato's own.
+        var manifest = await GetManifestAsync().ConfigureAwait(false);
+        var r = await GetJsonAsync<StremioStreamsResponse>(
+            url,
+            IsAioStreams(manifest) ? AioStreamsUserAgent : null
+        );
 
         return r?.Streams ?? [];
     }
@@ -960,21 +1098,141 @@ public class StremioAppExtras
     public List<StremioCast>? Directors { get; set; }
     public List<StremioCast>? Writers { get; set; }
     public string? Certification { get; set; }
-    public List<String?>? SeasonPosters { get; set; }
+
+    [JsonConverter(typeof(SeasonPostersConverter))]
+    public StremioSeasonPosters? SeasonPosters { get; set; }
+
+    /// <summary>
+    /// The keyed map AIOMetadata sent next to the legacy list before 3.0 moved it into
+    /// <see cref="SeasonPosters"/>.
+    /// </summary>
+    [JsonConverter(typeof(SeasonPostersConverter))]
+    public StremioSeasonPosters? SeasonPosterByNumber { get; set; }
 
     [JsonPropertyName("releaseDates")]
     public TmdbReleaseDatesContainer? ReleaseDates { get; set; }
+
+    /// <summary>The poster for a season, preferring a map keyed by season number over the list.</summary>
+    public string? GetSeasonPoster(int seasonNumber, IEnumerable<StremioMeta>? videos) =>
+        SeasonPosterByNumber?.ByNumber is not null
+            ? SeasonPosterByNumber.Get(seasonNumber, videos)
+            : SeasonPosters?.Get(seasonNumber, videos);
 }
 
-public class TmdbFindResponse
+/// <summary>
+/// Season posters as the addon sends them. AIOMetadata 3.0 keys them by season number
+/// (<c>{"0": url, "1": url}</c>); older versions send a bare list in the order of the provider's
+/// seasons, specials first when the show has them, without saying which season is which.
+/// Only AIOMetadata sends season posters; with other meta addons this is absent.
+/// </summary>
+public class StremioSeasonPosters
 {
-    [JsonPropertyName("movie_results")]
-    public List<TmdbFindResult>? MovieResults { get; set; }
+    public Dictionary<int, string>? ByNumber { get; set; }
+    public List<string?>? Ordered { get; set; }
+
+    /// <summary>
+    /// The poster for a season, or null. For the legacy list the position is mapped onto the
+    /// seasons the meta's videos carry; when those do not line up with the list, index 0 is
+    /// taken as specials only if the videos have a season 0.
+    /// </summary>
+    public string? Get(int seasonNumber, IEnumerable<StremioMeta>? videos)
+    {
+        if (ByNumber is not null)
+            return ByNumber.TryGetValue(seasonNumber, out var keyed) ? keyed : null;
+
+        if (Ordered is not { Count: > 0 } list)
+            return null;
+
+        var seasons = (videos ?? [])
+            .Where(v => v.Season.HasValue)
+            .Select(v => v.Season!.Value)
+            .Distinct()
+            .Order()
+            .ToList();
+
+        int index;
+        if (seasons.Count == list.Count)
+            index = seasons.IndexOf(seasonNumber);
+        else
+            index = seasons.Contains(0) ? seasonNumber : seasonNumber - 1;
+
+        var poster = index >= 0 && index < list.Count ? list[index] : null;
+        return string.IsNullOrWhiteSpace(poster) ? null : poster;
+    }
 }
 
-public class TmdbFindResult
+/// <summary>
+/// Reads <c>seasonPosters</c> as either the keyed object of AIOMetadata 3.0 or the legacy list.
+/// Anything else, or a key that is not a season number, is skipped.
+/// </summary>
+public sealed class SeasonPostersConverter : JsonConverter<StremioSeasonPosters?>
+{
+    public override StremioSeasonPosters? Read(
+        ref Utf8JsonReader r,
+        Type t,
+        JsonSerializerOptions o
+    )
+    {
+        switch (r.TokenType)
+        {
+            case JsonTokenType.StartObject:
+                var byNumber = new Dictionary<int, string>();
+                while (r.Read() && r.TokenType != JsonTokenType.EndObject)
+                {
+                    var key = r.GetString();
+                    r.Read();
+                    if (
+                        r.TokenType == JsonTokenType.String
+                        && int.TryParse(
+                            key,
+                            NumberStyles.Integer,
+                            CultureInfo.InvariantCulture,
+                            out var n
+                        )
+                        && r.GetString() is { } url
+                        && !string.IsNullOrWhiteSpace(url)
+                    )
+                        byNumber[n] = url;
+                    else
+                        r.Skip();
+                }
+                return new StremioSeasonPosters { ByNumber = byNumber };
+            case JsonTokenType.StartArray:
+                var ordered = new List<string?>();
+                while (r.Read() && r.TokenType != JsonTokenType.EndArray)
+                {
+                    ordered.Add(r.TokenType == JsonTokenType.String ? r.GetString() : null);
+                    r.Skip();
+                }
+                return new StremioSeasonPosters { Ordered = ordered };
+            default:
+                r.Skip();
+                return null;
+        }
+    }
+
+    public override void Write(Utf8JsonWriter w, StremioSeasonPosters? v, JsonSerializerOptions o)
+    {
+        if (v?.ByNumber is { } byNumber)
+        {
+            w.WriteStartObject();
+            foreach (var (n, url) in byNumber)
+                w.WriteString(n.ToString(CultureInfo.InvariantCulture), url);
+            w.WriteEndObject();
+        }
+        else if (v?.Ordered is { } ordered)
+            JsonSerializer.Serialize(w, ordered, o);
+        else
+            w.WriteNullValue();
+    }
+}
+
+public class TmdbMovieReleaseDates
 {
     public int? Id { get; set; }
+
+    [JsonPropertyName("release_dates")]
+    public TmdbReleaseDatesContainer? ReleaseDates { get; set; }
 }
 
 public class TmdbReleaseDatesContainer
@@ -1029,6 +1287,80 @@ public class StremioStream
     public List<string>? Sources { get; set; }
     public StremioBehaviorHints? BehaviorHints { get; set; }
 
+    /// <summary>
+    /// AIOStreams' details of the stream (torrent, size, file name, …). Not part of the Stremio
+    /// protocol and only sent to clients AIOStreams chooses, so read loosely: a different shape
+    /// from another addon must not fail the whole response.
+    /// </summary>
+    public JsonElement? StreamData { get; set; }
+
+    /// <summary>
+    /// What identifies the stream's file for RemuxDB. The torrent comes from AIOStreams'
+    /// stream data, or from a URL that carries its info hash as a path segment (Torrentio and
+    /// similar debrid resolve URLs).
+    /// </summary>
+    public RemuxDb.StreamIdentity GetIdentity()
+    {
+        var data = StreamData is { ValueKind: JsonValueKind.Object } d ? d : (JsonElement?)null;
+        var torrent =
+            data is { } sd
+            && sd.TryGetProperty("torrent", out var t)
+            && t.ValueKind == JsonValueKind.Object
+                ? t
+                : (JsonElement?)null;
+
+        var infoHash = torrent is { } tor ? GetString(tor, "infoHash") : null;
+        infoHash = IsInfoHash(infoHash) ? infoHash : InfoHashFromUrl(Url);
+
+        int? fileIdx =
+            torrent is { } tor2 && GetLong(tor2, "fileIdx") is { } idx && idx is >= 0 and <= int.MaxValue
+                ? (int)idx
+                : null;
+
+        var size = data is { } sd2 ? GetLong(sd2, "size") : null;
+        size = size is > 0 ? size : BehaviorHints?.VideoSize;
+
+        var filename = BehaviorHints?.Filename;
+        if (string.IsNullOrWhiteSpace(filename) && data is { } sd3)
+            filename = GetString(sd3, "filename");
+
+        return new RemuxDb.StreamIdentity(
+            infoHash?.ToLowerInvariant(),
+            fileIdx,
+            size is > 0 ? size : null,
+            string.IsNullOrWhiteSpace(filename) ? null : filename
+        );
+
+        static string? GetString(JsonElement obj, string name) =>
+            obj.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String
+                ? v.GetString()
+                : null;
+
+        static long? GetLong(JsonElement obj, string name) =>
+            obj.TryGetProperty(name, out var v)
+                ? v.ValueKind switch
+                {
+                    JsonValueKind.Number when v.TryGetInt64(out var n) => n,
+                    JsonValueKind.String
+                        when long.TryParse(
+                            v.GetString(),
+                            NumberStyles.None,
+                            CultureInfo.InvariantCulture,
+                            out var n
+                        ) => n,
+                    _ => null,
+                }
+                : null;
+    }
+
+    private static bool IsInfoHash(string? value) =>
+        value is { Length: 40 } && value.All(char.IsAsciiHexDigit);
+
+    private static string? InfoHashFromUrl(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            ? uri.AbsolutePath.Split('/').FirstOrDefault(IsInfoHash)
+            : null;
+
     public string GetName()
     {
         if (!string.IsNullOrWhiteSpace(Title))
@@ -1078,11 +1410,6 @@ public class StremioStream
             return false;
 
         return !(uri.PathAndQuery == "/" || string.IsNullOrEmpty(uri.PathAndQuery));
-    }
-
-    public bool IsFile()
-    {
-        return !string.IsNullOrWhiteSpace(Url);
     }
 
     public bool IsTorrent()

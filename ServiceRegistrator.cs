@@ -1,7 +1,9 @@
 using Gelato.Config;
 using Gelato.Decorators;
 using Gelato.Filters;
+using System.Net;
 using Gelato.Providers;
+using Gelato.RemuxDb;
 using Gelato.ScheduledTasks;
 using Gelato.Services;
 //using IntroDbPlugin.Services;
@@ -42,7 +44,11 @@ public class ServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton<StreamUserDataFilter>();
         services.AddSingleton<VersionActionFilter>();
         services.AddSingleton<UnreleasedListingFilter>();
+        services.AddSingleton<MediaSegmentFilter>();
+        services.AddSingleton<ItemIdLookup>();
         services.AddSingleton<GelatoManager>();
+        services.AddSingleton<ItemWriteCounter>();
+        services.DecorateSingle<IItemPersistenceService, ItemPersistenceServiceDecorator>();
         services.DecorateSingle<IItemRepository, GelatoItemRepository>();
         services.AddSingleton(sp => (GelatoItemRepository)sp.GetRequiredService<IItemRepository>());
         services.DecorateSingle<IUserDataManager, UserDataManagerDecorator>();
@@ -58,6 +64,7 @@ public class ServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton<IHostedService, GelatoJavaScriptRegistrationService>();
         services.AddSingleton<IHostedService, UpgradeRepairService>();
         services.AddSingleton<IHostedService, StreamUserDataSync>();
+        services.AddSingleton<IHostedService, PreProbeNextEpisodeService>();
         services.AddSingleton<IHostedService, LegacyRowAdoptionService>();
         services.AddSingleton<SubtitleProvider>();
         services.AddSingleton<ISubtitleProvider>(sp => sp.GetRequiredService<SubtitleProvider>());
@@ -104,6 +111,19 @@ public class ServiceRegistrator : IPluginServiceRegistrator
             sp.GetRequiredService<ISessionManager>
         ));
 
+        services
+            .AddHttpClient<RemuxDbClient>(client =>
+            {
+                client.Timeout = TimeSpan.FromSeconds(30);
+                client.DefaultRequestHeaders.UserAgent.TryParseAdd(GelatoPlugin.UserAgent);
+            })
+            .ConfigurePrimaryHttpMessageHandler(() =>
+                new SocketsHttpHandler { AutomaticDecompression = DecompressionMethods.All }
+            );
+        services.AddSingleton<RemuxDbContributor>();
+        services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<RemuxDbContributor>());
+        services.AddSingleton<RemuxDbService>();
+
         services.AddHostedService<GelatoService>();
         services
             .DecorateSingle<IDtoService, DtoServiceDecorator>()
@@ -140,6 +160,7 @@ public class ServiceRegistrator : IPluginServiceRegistrator
             o.Filters.AddService<StreamUserDataFilter>();
             o.Filters.AddService<VersionActionFilter>();
             o.Filters.AddService<UnreleasedListingFilter>();
+            o.Filters.AddService<MediaSegmentFilter>();
         });
     }
 

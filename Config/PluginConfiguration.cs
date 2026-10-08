@@ -18,9 +18,6 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool FilterUnreleased { get; set; } = false;
     public int FilterUnreleasedBufferDays { get; set; } = 0;
     public bool DisableSourceCount { get; set; } = true;
-    public bool P2PEnabled { get; set; } = false;
-    public int P2PDLSpeed { get; set; } = 0;
-    public int P2PULSpeed { get; set; } = 0;
     public string FFmpegAnalyzeDuration { get; set; } = "5M";
     public string FFmpegProbeSize { get; set; } = "40M";
     public bool CreateCollections { get; set; } = false;
@@ -30,6 +27,32 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool LazyImages { get; set; } = false;
     public List<CatalogConfig> Catalogs { get; set; } = [];
     public List<UserConfig> UserConfigs { get; set; } = [];
+
+    /// <summary>
+    /// Fill in a stream's tracks, runtime and size from RemuxDB when its streams are synced,
+    /// so they show before playback and playback skips its probe.
+    /// </summary>
+    public bool RemuxDbEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Probe a stream before it is played: when its item is opened or another version of it is
+    /// picked, and the next episode while an episode nears its end. Playback of a stream
+    /// that needs a probe then starts without waiting for it.
+    /// </summary>
+    public bool PreProbe { get; set; } = true;
+
+    /// <summary>
+    /// Submit a stream's probe to RemuxDB when it played a file RemuxDB did not know. Anonymous,
+    /// and only for streams whose torrent is known.
+    /// </summary>
+    public bool RemuxDbContribute { get; set; } = true;
+
+    public string RemuxDbUrl { get; set; } = RemuxDb.RemuxDbClient.DefaultUrl;
+
+    /// <summary>
+    /// Random id RemuxDB requires of every client, created on first use. Tied to nothing else.
+    /// </summary>
+    public string RemuxDbClientId { get; set; } = "";
 
     /// <summary>
     /// The Jellyfin version Gelato last started against, so it can tell when the server has been
@@ -142,13 +165,15 @@ public class UserConfig
             FilterUnreleased = baseConfig.FilterUnreleased,
             FilterUnreleasedBufferDays = baseConfig.FilterUnreleasedBufferDays,
             DisableSourceCount = baseConfig.DisableSourceCount,
-            P2PEnabled = baseConfig.P2PEnabled,
-            P2PDLSpeed = baseConfig.P2PDLSpeed,
-            P2PULSpeed = baseConfig.P2PULSpeed,
             FFmpegAnalyzeDuration = baseConfig.FFmpegAnalyzeDuration,
             FFmpegProbeSize = baseConfig.FFmpegProbeSize,
             CreateCollections = baseConfig.CreateCollections,
             MaxCollectionItems = baseConfig.MaxCollectionItems,
+            RemuxDbEnabled = baseConfig.RemuxDbEnabled,
+            PreProbe = baseConfig.PreProbe,
+            RemuxDbContribute = baseConfig.RemuxDbContribute,
+            RemuxDbUrl = baseConfig.RemuxDbUrl,
+            RemuxDbClientId = baseConfig.RemuxDbClientId,
             UserConfigs = baseConfig.UserConfigs,
         };
     }

@@ -12,8 +12,11 @@ using Microsoft.AspNetCore.Http;
 
 namespace Gelato.Decorators;
 
-public sealed class GelatoItemRepository(IItemRepository inner, IHttpContextAccessor http)
-    : IItemRepository
+public sealed class GelatoItemRepository(
+    IItemRepository inner,
+    IHttpContextAccessor http,
+    ItemWriteCounter writes
+) : IItemRepository
 {
     private static readonly BaseItemKind[] ListScopeMediaKinds =
     [
@@ -76,9 +79,20 @@ public sealed class GelatoItemRepository(IItemRepository inner, IHttpContextAcce
         )
             return filter;
 
-        var ctx = _http.HttpContext;
-        var isListingIntent =
-            ctx is not null && (ctx.IsApiListing() || ctx.IsHomeScreenSectionListing());
+        // Targeted ItemIds lookups are generally internal existence/permission checks.
+        // Keep those untouched so the caller gets strict results from the underlying query.
+        // The ids must have come from the caller: Jellyfin 12 turns a searchTerm into a list of
+        // ItemIds before querying, so treating any populated ItemIds as targeted would let every
+        // search return the hidden stream rows alongside the item they belong to.
+        var isListingIntent = _http.ReadRequest(
+            ctx =>
+                (ctx.IsApiListing() || ctx.IsHomeScreenSectionListing())
+                && !(
+                    (filter.ItemIds.Length > 0 && ctx.HasExplicitItemIds())
+                    || ctx.IsSingleItemList()
+                ),
+            false
+        );
         if (!isListingIntent)
             return filter;
 
@@ -89,17 +103,6 @@ public sealed class GelatoItemRepository(IItemRepository inner, IHttpContextAcce
             GelatoManager.StreamTag,
             StringComparer.OrdinalIgnoreCase
         );
-        var isTargetedLookup =
-            ctx is not null
-            && ((filter.ItemIds.Length > 0 && ctx.HasExplicitItemIds()) || ctx.IsSingleItemList());
-
-        // Targeted ItemIds lookups are generally internal existence/permission checks.
-        // Keep those untouched so the caller gets strict results from the underlying query.
-        // The ids must have come from the caller: Jellyfin 12 turns a searchTerm into a list of
-        // ItemIds before querying, so treating any populated ItemIds as targeted would let every
-        // search return the hidden stream rows alongside the item they belong to.
-        if (isTargetedLookup)
-            return filter;
 
         if (!includesPerson)
             filter.IsDeadPerson = null;
@@ -146,10 +149,45 @@ public sealed class GelatoItemRepository(IItemRepository inner, IHttpContextAcce
     /// so <see cref="Filters.UnreleasedListingFilter"/> needs the same set to finish the job on the
     /// response.
     /// </summary>
-    public Guid[] GetUnreleasedIds(int bufferDays) =>
-        GetUnreleasedGelatoIds(DateTime.Today.AddDays(-bufferDays));
+    public IReadOnlySet<Guid> GetUnreleasedIds(int bufferDays) =>
+        GetUnreleased(DateTime.Today.AddDays(-bufferDays)).Set;
 
-    private Guid[] GetUnreleasedGelatoIds(DateTime cutoff) =>
+    /// <summary>
+    /// Makes the next listing read the unreleased set again, whatever was written since.
+    /// </summary>
+    public void ForgetUnreleasedIds() => writes.Bump();
+
+    private Guid[] GetUnreleasedGelatoIds(DateTime cutoff) => GetUnreleased(cutoff).Ids;
+
+    private sealed record UnreleasedIds(long Cutoff, long Version, Guid[] Ids, HashSet<Guid> Set);
+
+    private volatile UnreleasedIds _unreleased;
+
+    // Every listing asks for the set, a home screen about twenty times, and reading it walks
+    // every movie, series, season and episode (15 to 17 ms on a library of 4.7k), for a set that
+    // changes a few times a day. It is kept until the next item write (ItemWriteCounter), the
+    // next day or another buffer (both move the cutoff), and a saved configuration or a purge
+    // (GelatoManager.ClearCache). The count is taken before the query: a write that lands while
+    // it runs leaves the answer stored under a count that is no longer current, so the next
+    // listing reads again. Neither the array nor the set is ever changed after it is stored.
+    // Nothing is kept while nobody counts the writes (the persistence service is not decorated,
+    // which should not happen): a set that is never thrown away would hide and show the wrong
+    // items for good.
+    private UnreleasedIds GetUnreleased(DateTime cutoff)
+    {
+        var version = writes.Version;
+        var kept = _unreleased;
+        if (kept is not null && kept.Cutoff == cutoff.Ticks && kept.Version == version)
+            return kept;
+
+        var ids = QueryUnreleasedGelatoIds(cutoff);
+        var read = new UnreleasedIds(cutoff.Ticks, version, ids, [.. ids]);
+        if (writes.IsCounting)
+            _unreleased = read;
+        return read;
+    }
+
+    private Guid[] QueryUnreleasedGelatoIds(DateTime cutoff) =>
         inner
             .GetItemIdsList(
                 new InternalItemsQuery

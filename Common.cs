@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -202,6 +204,83 @@ public sealed class KeyLock
 }
 
 /// <summary>
+/// Answers asked for ahead of the request that needs them, handed over once.
+/// </summary>
+/// <remarks>
+/// An answer is taken by the first request that asks for its key within
+/// <paramref name="lifetime"/> of its start, still under way or finished, and by nobody after
+/// that: whoever comes later asks for himself. One that failed is dropped, so nobody is handed
+/// a failure he did not wait for; whoever took it while it was under way gets its failure, as
+/// he would have from a request of his own.
+/// </remarks>
+/// <param name="lifetime">How long an answer waits to be taken.</param>
+/// <param name="untaken">Told the key of an answer nobody took within the lifetime.</param>
+public sealed class AheadOfTime<T>(TimeSpan lifetime, Action<string>? untaken = null)
+{
+    private sealed record Entry(Task<T> Answer, long StartedAt);
+
+    private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
+
+    private bool IsFresh(Entry entry) =>
+        Environment.TickCount64 - entry.StartedAt < lifetime.TotalMilliseconds;
+
+    /// <summary>
+    /// Starts <paramref name="ask"/> for the key unless one started within the lifetime is
+    /// still waiting to be taken.
+    /// </summary>
+    public void Start(string key, Func<Task<T>> ask)
+    {
+        Entry entry;
+        lock (_entries)
+        {
+            if (_entries.TryGetValue(key, out var kept) && IsFresh(kept))
+                return;
+
+            entry = new Entry(ask(), Environment.TickCount64);
+            _entries[key] = entry;
+        }
+
+        var mine = new KeyValuePair<string, Entry>(key, entry);
+        _ = entry.Answer.ContinueWith(
+            t =>
+            {
+                // Looked at, so that it does not surface as an unobserved exception.
+                _ = t.Exception;
+                _entries.TryRemove(mine);
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.NotOnRanToCompletion
+                | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        );
+        _ = Task.Delay(lifetime)
+            .ContinueWith(
+                _ =>
+                {
+                    if (_entries.TryRemove(mine))
+                        untaken?.Invoke(key);
+                },
+                TaskScheduler.Default
+            );
+    }
+
+    /// <summary>Drops every answer nobody has taken yet.</summary>
+    public void Clear() => _entries.Clear();
+
+    /// <summary>
+    /// The answer started for the key, or null when there is none to hand over. It is gone
+    /// from here either way.
+    /// </summary>
+    public Task<T>? TryTake(string key) =>
+        _entries.TryRemove(key, out var entry)
+        && IsFresh(entry)
+        && !entry.Answer.IsFaulted
+        && !entry.Answer.IsCanceled
+            ? entry.Answer
+            : null;
+}
+
+/// <summary>
 /// Makes URLs safe to write to Jellyfin's log. Stream URLs, addon URLs and the http paths of
 /// stream items carry the user's debrid API key or addon config in their path or query, and
 /// users paste their logs into public issues and chats.
@@ -309,24 +388,12 @@ public static class ActionContextExtensions
         "GetSearchHints",
     };
 
-    private static readonly HashSet<string> InsertableActionNames = new(
+    // The user data writes. A client offers them from a search result's context menu, before the
+    // result was opened, so they materialize the title like any other insertable action.
+    private static readonly HashSet<string> UserDataActionNames = new(
         StringComparer.OrdinalIgnoreCase
     )
     {
-        "GetItems",
-        "GetItem",
-        "GetItemLegacy",
-        "GetItemsByUserIdLegacy",
-        "GetPlaybackInfo",
-        "GetPostedPlaybackInfo",
-        "GetVideoStream",
-        // Same stream, under a container extension: a separate action that delegates to
-        // GetVideoStream. Clients that play /Videos/{id}/stream.mkv would otherwise get a 404
-        // for a search result that was never opened, because nothing materializes it.
-        "GetVideoStreamByContainer",
-        "GetDownload",
-        "GetSubtitleWithTicks",
-        // Clients offer these from a search result's context menu, before the result was opened.
         "MarkPlayedItem",
         "MarkPlayedItemLegacy",
         "MarkFavoriteItem",
@@ -335,6 +402,59 @@ public static class ActionContextExtensions
         "UpdateUserItemRatingLegacy",
         "UpdateItemUserData",
         "UpdateItemUserDataLegacy",
+    };
+
+    // The ones that reach a series' episodes: played is stored per episode and a folder counts as
+    // played when all of them are, so these need the tree to be complete before they run. A
+    // favourite or a rating is kept on the series itself and does not wait for anything.
+    private static readonly HashSet<string> PlayedStateActionNames = new(
+        StringComparer.OrdinalIgnoreCase
+    )
+    {
+        "MarkPlayedItem",
+        "MarkPlayedItemLegacy",
+        "UpdateItemUserData",
+        "UpdateItemUserDataLegacy",
+    };
+
+    private static readonly HashSet<string> InsertableActionNames = new(
+        [
+            "GetItems",
+            "GetItem",
+            "GetItemLegacy",
+            "GetItemsByUserIdLegacy",
+            "GetPlaybackInfo",
+            "GetPostedPlaybackInfo",
+            "GetVideoStream",
+            // Same stream, under a container extension: a separate action that delegates to
+            // GetVideoStream. Clients that play /Videos/{id}/stream.mkv would otherwise get a 404
+            // for a search result that was never opened, because nothing materializes it.
+            "GetVideoStreamByContainer",
+            "GetDownload",
+            "GetSubtitleWithTicks",
+            // The breadcrumb of a details page. jellyfin-web asks for it before it asks for the
+            // item (seen in the browser 2026-09-22: Ancestors 404, then the item 200, then
+            // Ancestors again 200), so nothing has materialized the title when it arrives and
+            // resolving it to an existing item is not enough. The other per-item reads of that
+            // page follow the item call and are answered by the redirect it remembers.
+            "GetAncestors",
+            .. UserDataActionNames,
+            ],
+        StringComparer.OrdinalIgnoreCase
+    );
+
+    // The adds to a collection or a playlist, and the creation of one with items in it. They name
+    // their items in an id list, and a multi-select hands over several search results at once,
+    // none of them opened. Kept out of the insertable actions: those also let a media source
+    // lookup sync the item's streams, which an add to a group has no use for.
+    private static readonly HashSet<string> GroupAddActionNames = new(
+        StringComparer.OrdinalIgnoreCase
+    )
+    {
+        "AddToCollection",
+        "AddItemToPlaylist",
+        "CreateCollection",
+        "CreatePlaylist",
     };
 
     // Jellyfin answers playback info under two actions: GET /Items/{id}/PlaybackInfo and
@@ -354,6 +474,35 @@ public static class ActionContextExtensions
         "GetItems",
         "GetItemsByUserIdLegacy",
     };
+
+    /// <summary>
+    /// Reads from the request the accessor carries, or returns <paramref name="none"/> when there
+    /// is no request or it has already finished.
+    /// </summary>
+    /// <remarks>
+    /// The accessor's context flows with the ExecutionContext, so work a request started, such as
+    /// a scheduled task run from the dashboard, still sees that request after it has finished.
+    /// Reading a finished request throws ObjectDisposedException, which failed the task on its
+    /// first repository query, so a finished request counts as no request.
+    /// </remarks>
+    public static T ReadRequest<T>(
+        this IHttpContextAccessor http,
+        Func<HttpContext, T> read,
+        T none
+    )
+    {
+        if (http.HttpContext is not { } ctx)
+            return none;
+
+        try
+        {
+            return read(ctx);
+        }
+        catch (ObjectDisposedException)
+        {
+            return none;
+        }
+    }
 
     public static string? GetActionName(this ActionExecutingContext ctx) =>
         (ctx.ActionDescriptor as ControllerActionDescriptor)?.ActionName;
@@ -399,6 +548,19 @@ public static class ActionContextExtensions
     public static bool IsPlaybackInfoAction(this HttpContext? ctx) =>
         ctx?.GetActionName() is { } actionName && PlaybackInfoActionNames.Contains(actionName);
 
+    /// <summary>
+    /// Whether the action answers with the item's media sources whatever the request asks for:
+    /// the item itself (Jellyfin builds it with every field) and its playback info. Listing
+    /// them is what syncs a movie's or an episode's streams.
+    /// </summary>
+    public static bool ListsMediaSources(this ActionExecutingContext ctx) =>
+        ctx.GetActionName() is { } actionName
+        && (
+            PlaybackInfoActionNames.Contains(actionName)
+            || actionName.Equals("GetItem", StringComparison.OrdinalIgnoreCase)
+            || actionName.Equals("GetItemLegacy", StringComparison.OrdinalIgnoreCase)
+        );
+
     public static bool IsInsertableAction(this HttpContext ctx)
     {
         var actionName = ctx.GetActionName();
@@ -412,6 +574,102 @@ public static class ActionContextExtensions
 
     public static bool IsInsertableAction(this ActionExecutingContext ctx) =>
         ctx.HttpContext.IsInsertableAction();
+
+    public static bool IsGroupAddAction(this ActionExecutingContext ctx) =>
+        ctx.GetActionName() is { } actionName && GroupAddActionNames.Contains(actionName);
+
+    /// <summary>
+    /// The ids an action was given as a list, or none when it takes no such list.
+    /// </summary>
+    /// <remarks>
+    /// Jellyfin has three shapes for it: guids in the query (the adds, and CreatePlaylist's
+    /// obsolete query form), strings in the query (CreateCollection) and a list in the request
+    /// body (CreatePlaylist).
+    /// </remarks>
+    public static IReadOnlyList<Guid> GetIdList(this ActionExecutingContext ctx)
+    {
+        var all = new List<Guid>();
+        foreach (var (key, value) in ctx.ActionArguments)
+        {
+            switch (value)
+            {
+                case Guid[] ids when IdsGuidKeys.Contains(key):
+                    all.AddRange(ids);
+                    break;
+                case string[] ids when IdsGuidKeys.Contains(key):
+                    all.AddRange(ids.Where(s => Guid.TryParse(s, out _)).Select(Guid.Parse));
+                    break;
+                case not null when TryGetBodyIdList(value, out _, out var ids):
+                    all.AddRange(ids);
+                    break;
+            }
+        }
+
+        return all;
+    }
+
+    /// <summary>
+    /// The id list a request body carries, as the body of CreatePlaylist does. It is one of
+    /// Jellyfin's API models, which a plugin does not reference, so the list is found by name.
+    /// </summary>
+    private static bool TryGetBodyIdList(object body, out PropertyInfo property, out Guid[] ids)
+    {
+        property = null!;
+        ids = [];
+        if (
+            body is string or Array or ValueType
+            || body.GetType().GetProperty("Ids") is not { CanWrite: true } found
+            || !found.PropertyType.IsAssignableFrom(typeof(Guid[]))
+            || found.GetValue(body) is not IEnumerable<Guid> list
+        )
+            return false;
+
+        property = found;
+        ids = list.ToArray();
+        return true;
+    }
+
+    /// <summary>
+    /// Whether the request may be answered from the library item a search result is, without
+    /// materializing anything: every safe read.
+    /// </summary>
+    /// <remarks>
+    /// A client that opened a search result keeps the result's id in the page URL and asks for
+    /// the ancestors, similar items, theme media and the rest with it. None of those actions
+    /// insert, so they are not insertable actions, and Jellyfin has never stored the id: the
+    /// breadcrumb of a title the library already holds answered 404. Resolving the id to the
+    /// item it belongs to costs a cache lookup for ids no search produced.
+    /// </remarks>
+    public static bool IsCanonicalIdRead(this HttpContext ctx) =>
+        HttpMethods.IsGet(ctx.Request.Method) || HttpMethods.IsHead(ctx.Request.Method);
+
+    public static bool IsCanonicalIdRead(this ActionExecutingContext ctx) =>
+        ctx.HttpContext.IsCanonicalIdRead();
+
+    /// <summary>
+    /// The played state a user data write asks for, or null when the action does not set one. The
+    /// mark actions say played; the generic update carries the flag in its body.
+    /// </summary>
+    public static bool? WantsPlayedState(this ActionExecutingContext ctx)
+    {
+        if (
+            ctx.GetActionName() is not { } actionName
+            || !PlayedStateActionNames.Contains(actionName)
+        )
+            return null;
+
+        if (!actionName.StartsWith("UpdateItemUserData", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // The body is one of Jellyfin's API models, which a plugin does not reference.
+        foreach (var argument in ctx.ActionArguments.Values)
+        {
+            if (argument?.GetType().GetProperty("Played")?.GetValue(argument) is bool played)
+                return played;
+        }
+
+        return null;
+    }
 
     public static bool IsSingleItemList(this HttpContext ctx)
     {
@@ -498,6 +756,12 @@ public static class ActionContextExtensions
     /// Replaces every id in the route, the query-bound arguments and id lists that
     /// <paramref name="map"/> knows a replacement for. Returns whether anything changed.
     /// </summary>
+    /// <remarks>
+    /// An id list is not always a <c>Guid[]</c>: CreateCollection binds its ids as strings and
+    /// CreatePlaylist takes them in its body. Left as they were, a search result that had been
+    /// opened still reached Jellyfin under its stand-in id: the new collection answered 400, the
+    /// new playlist 200 and stayed empty.
+    /// </remarks>
     public static bool RedirectGuids(this ActionExecutingContext ctx, Func<Guid, Guid?> map)
     {
         var changed = false;
@@ -523,6 +787,22 @@ public static class ActionContextExtensions
                     break;
                 case Guid[] ids when ids.Any(g => map(g) is not null):
                     ctx.ActionArguments[key] = ids.Select(g => map(g) ?? g).Distinct().ToArray();
+                    changed = true;
+                    break;
+                case string[] ids
+                    when IdsGuidKeys.Contains(key)
+                        && ids.Any(s => Guid.TryParse(s, out var g) && map(g) is not null):
+                    ctx.ActionArguments[key] = ids.Select(s =>
+                            Guid.TryParse(s, out var g) && map(g) is { } to ? to.ToString("N") : s
+                        )
+                        .Distinct()
+                        .ToArray();
+                    changed = true;
+                    break;
+                case not null
+                    when TryGetBodyIdList(value, out var property, out var ids)
+                        && ids.Any(g => map(g) is not null):
+                    property.SetValue(value, ids.Select(g => map(g) ?? g).Distinct().ToArray());
                     changed = true;
                     break;
             }
@@ -637,6 +917,24 @@ public static class BaseItemExtensions
             item.EndDate = null;
         }
     }
+
+    private static readonly ConditionalWeakTable<BaseItem, object> ItemsNotInLibrary = new();
+    private static readonly object NotInLibraryMark = new();
+
+    /// <summary>
+    /// Marks an item built for a search result whose id no item of the library has, as its own
+    /// or as the owner of a version. What the database holds per item (linked versions, media
+    /// streams, attachments) can only be empty for it, so nobody has to ask.
+    /// </summary>
+    /// <remarks>
+    /// The mark is on the instance, not on the id: the item the result becomes when it is opened
+    /// is another instance with the same id, and that one is in the library.
+    /// </remarks>
+    public static void MarkNotInLibrary(this BaseItem item) =>
+        ItemsNotInLibrary.AddOrUpdate(item, NotInLibraryMark);
+
+    public static bool IsNotInLibrary(this BaseItem item) =>
+        ItemsNotInLibrary.TryGetValue(item, out _);
 
     public static bool HasStreamTag(this BaseItem item)
     {
