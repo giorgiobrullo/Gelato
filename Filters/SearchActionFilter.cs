@@ -107,6 +107,12 @@ public class SearchActionFilter(
         // whose answer is dropped with it.
         var metas = await addon;
 
+        // The first results are the likely clicks: their full meta is fetched now so that opening
+        // one does not wait for it. Not for the one- and two-letter searches a client sends while
+        // the term is still being typed, nor for later pages.
+        if (start == 0 && searchTerm.Trim().Length >= 3)
+            stremio.PrefetchMetas(metas);
+
         // The addon's result for a title the library already has and the library's own item are
         // the same title twice. The addon's half answers with the library's item where there is
         // one, in the result's own place — the addon's order is the search's relevance, and an
