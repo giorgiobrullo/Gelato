@@ -48,7 +48,7 @@ public sealed partial class RepairWatchStateTask(
     /// The well-known item Jellyfin parks detached user data on. Mirrors
     /// <c>BaseItemRepository.PlaceholderId</c>, which is not on the plugin-facing API surface.
     /// </summary>
-    private static readonly Guid PlaceholderId = new("00000000-0000-0000-0000-000000000001");
+    internal static readonly Guid PlaceholderId = new("00000000-0000-0000-0000-000000000001");
 
     // Uneven because the phases are: reattaching is a local query per item and usually finds
     // nothing after an upgrade, while re-importing is a network round trip each.
