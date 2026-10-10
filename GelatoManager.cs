@@ -1335,7 +1335,13 @@ public sealed class GelatoManager(
         }
         else
         {
-            baseItem = await SyncSeriesTreesAsync(cfg, meta, ct, root: parent)
+            baseItem = await SyncSeriesTreesAsync(
+                    cfg,
+                    meta,
+                    ct,
+                    root: parent,
+                    refreshNewSeries: !refreshItem
+                )
                 .ConfigureAwait(false);
         }
 
@@ -2613,12 +2619,19 @@ public sealed class GelatoManager(
         return item;
     }
 
+    /// <param name="refreshNewSeries">
+    /// Whether a series this creates gets its metadata refresh before the tree is built. The
+    /// insert of a search result passes false: it refreshes the item itself, in the background,
+    /// once the tree is in, and this refresh (TheMovieDb and OMDb, live) made opening a new series
+    /// wait 0.5 s or more for metadata the addon's meta already carried.
+    /// </param>
     public async Task<BaseItem?> SyncSeriesTreesAsync(
         PluginConfiguration cfg,
         StremioMeta seriesMeta,
         CancellationToken ct,
         Series? existingSeries = null,
-        Folder? root = null
+        Folder? root = null,
+        bool refreshNewSeries = true
     )
     {
         // A catalog with a folder of its own creates its series there.
@@ -2668,7 +2681,8 @@ public sealed class GelatoManager(
                 };
 
                 tmpSeries.ParentId = seriesRootFolder.Id;
-                await tmpSeries.RefreshMetadata(options, ct).ConfigureAwait(false);
+                if (refreshNewSeries)
+                    await tmpSeries.RefreshMetadata(options, ct).ConfigureAwait(false);
                 seriesRootFolder.AddChild(tmpSeries);
                 await tmpSeries.UpdateToRepositoryAsync(ItemUpdateType.MetadataImport, ct);
                 await ReattachWatchStateAsync([tmpSeries], ct).ConfigureAwait(false);
@@ -4163,6 +4177,29 @@ public sealed class GelatoManager(
                 null,
                 primaryImage
             );
+
+        // The backdrop and logo too, which GelatoImageProvider would only add in the metadata
+        // refresh after the insert: a series or movie opened from search shows them on its first
+        // page instead of after a reload. The refresh does not replace images an item has.
+        if (item is Movie or Series)
+        {
+            if (!string.IsNullOrWhiteSpace(meta.Background))
+                ProviderManagerDecorator.SetRemoteImage(
+                    appPaths,
+                    item,
+                    ImageType.Backdrop,
+                    null,
+                    meta.Background
+                );
+            if (!string.IsNullOrWhiteSpace(meta.Logo))
+                ProviderManagerDecorator.SetRemoteImage(
+                    appPaths,
+                    item,
+                    ImageType.Logo,
+                    null,
+                    meta.Logo
+                );
+        }
 
         return item;
     }
