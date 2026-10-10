@@ -477,7 +477,15 @@ public sealed class GelatoManager(
         }
         else
         {
-            baseItem = await SyncSeriesTreesAsync(cfg, meta, ct).ConfigureAwait(false);
+            // A series that will be refreshed below skips the refresh before its tree: the
+            // addon's meta already carries what the page needs, and the tree is built from it.
+            baseItem = await SyncSeriesTreesAsync(
+                    cfg,
+                    meta,
+                    ct,
+                    refreshNewSeries: !refreshItem
+                )
+                .ConfigureAwait(false);
         }
 
         if (baseItem is null)
@@ -497,7 +505,11 @@ public sealed class GelatoManager(
                 ForceSave = true,
             };
 
-            if (queueRefreshItem)
+            if (baseItem is Series series)
+            {
+                RefreshNewSeriesInBackground(series, options);
+            }
+            else if (queueRefreshItem)
             {
                 provider.QueueRefresh(baseItem.Id, options, RefreshPriority.High);
             }
@@ -508,6 +520,37 @@ public sealed class GelatoManager(
         }
         _log.LogDebug("inserted new {Kind}: {Name}", baseItem.GetBaseItemKind(), baseItem.Name);
         return (baseItem, true);
+    }
+
+    /// <summary>
+    /// Refreshes a series just put into the library, and only the series, after the insert answered.
+    /// </summary>
+    /// <remarks>
+    /// Opening a series from search used to wait for Jellyfin's full refresh before its tree was
+    /// built: TheMovieDb and OMDb for the series, its images and its cast, 1.5 s of the 1.8 s an
+    /// insert took, for metadata the addon's meta already carried. And the refresh queued after the
+    /// insert was a full one too, which validates the series' children and refreshes every season
+    /// and episode in turn: TheMovieDb and OMDb again for each one, about 0.3 s an episode, mostly
+    /// answering that they have nothing. The tree is now built from the meta first, and this adds
+    /// what the series' own providers have on top (cast, ratings, images it lacks) without touching
+    /// the tree: <see cref="IProviderManager.RefreshSingleItem"/> runs the series' metadata service
+    /// and does not validate children the way <see cref="IProviderManager.RefreshFullItem"/> does.
+    /// </remarks>
+    private void RefreshNewSeriesInBackground(Series series, MetadataRefreshOptions options)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await provider
+                    .RefreshSingleItem(series, options, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Could not refresh the new series {Name}", series.Name);
+            }
+        });
     }
 
     /// <summary>
@@ -1641,6 +1684,11 @@ public sealed class GelatoManager(
                 if (refreshNewSeries)
                     await tmpSeries.RefreshMetadata(options, ct).ConfigureAwait(false);
                 seriesRootFolder.AddChild(tmpSeries);
+                // The series' key names the libraries it is in, which IntoBaseItem could not know
+                // before the series had a parent. Seasons and episodes are stamped with it below
+                // and the series finds them by it, so it is set now: when only a later refresh set
+                // it, the series lost its whole tree until every child was refreshed again.
+                tmpSeries.PresentationUniqueKey = tmpSeries.CreatePresentationUniqueKey();
                 await tmpSeries.UpdateToRepositoryAsync(ItemUpdateType.MetadataImport, ct);
                 await ReattachWatchStateAsync([tmpSeries], ct).ConfigureAwait(false);
                 series = tmpSeries;
