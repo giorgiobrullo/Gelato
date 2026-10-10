@@ -3,8 +3,10 @@ using System.Globalization;
 using Gelato.Config;
 using Gelato.Decorators;
 using Gelato.RemuxDb;
+using Gelato.ScheduledTasks;
 using Gelato.Services;
 using Jellyfin.Data.Enums;
+using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Net;
@@ -17,6 +19,7 @@ using MediaBrowser.Controller.Persistence;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.IO;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
 
@@ -24,6 +27,7 @@ namespace Gelato;
 
 public sealed class GelatoManager(
     ILoggerFactory loggerFactory,
+    IDbContextFactory<JellyfinDbContext> dbFactory,
     IProviderManager provider,
     GelatoItemRepository repo,
     IItemPersistenceService persistence,
@@ -2792,14 +2796,40 @@ public sealed class GelatoManager(
     {
         var reattached = 0;
 
-        foreach (var item in items)
+        // Stream rows copy the provider ids of the item they hang off, so they resolve to the
+        // same user data keys. Reattaching onto one would move the watch state to a row the
+        // user never sees.
+        var candidates = items.Where(i => !i.IsStream()).ToList();
+        if (candidates.Count == 0)
+            return;
+
+        // Reattaching is a database context, a transaction and two queries per item, 3 to 5 ms,
+        // which put 0.15 to 0.2 s on the insert of a series' tree for the usual outcome: a title
+        // never played before has nothing parked. One query finds the keys that are parked, and
+        // only the items holding one of them are reattached.
+        var keysByItem = candidates.ToDictionary(i => i.Id, i => i.GetUserDataKeys());
+        var keys = keysByItem.Values.SelectMany(k => k).Distinct(StringComparer.Ordinal).ToList();
+        var dbContext = await dbFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
+        HashSet<string> parked;
+        await using (dbContext.ConfigureAwait(false))
+        {
+            parked = (
+                await dbContext
+                    .UserData.AsNoTracking()
+                    .Where(e => e.ItemId == RepairWatchStateTask.PlaceholderId)
+                    .Where(e => keys.Contains(e.CustomDataKey))
+                    .Select(e => e.CustomDataKey)
+                    .Distinct()
+                    .ToListAsync(ct)
+                    .ConfigureAwait(false)
+            ).ToHashSet(StringComparer.Ordinal);
+        }
+
+        foreach (var item in candidates)
         {
             ct.ThrowIfCancellationRequested();
 
-            // Stream rows copy the provider ids of the item they hang off, so they resolve to the
-            // same user data keys. Reattaching onto one would move the watch state to a row the
-            // user never sees.
-            if (item.IsStream())
+            if (!keysByItem[item.Id].Any(parked.Contains))
                 continue;
 
             var before = item.UserData?.Count ?? 0;
