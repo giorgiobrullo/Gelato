@@ -29,6 +29,38 @@ public class GelatoStremioProvider(
 
     private static string TmdbKey(string kind, string id) => $"{kind}|{id.ToLowerInvariant()}";
 
+    /// <summary>How many results of a search get their meta asked for ahead of a click.</summary>
+    public const int PrefetchedSearchResults = 4;
+
+    /// <summary>
+    /// Asks for the full meta of the first search results in the background, so opening one
+    /// finds it in the cache.
+    /// </summary>
+    /// <remarks>
+    /// Opening a result that is not in the library waits for its full meta before the item can be
+    /// inserted: 0.4 to 2 seconds while aiometadata builds a title it has not built before, 50 to
+    /// 100 ms once it has. Search only gets the catalog's previews, so the wait came with every
+    /// first click. A click during the prefetch waits for that answer: the cache shares a request
+    /// already on its way.
+    /// </remarks>
+    public void PrefetchMetas(IEnumerable<StremioMeta> metas)
+    {
+        foreach (var meta in metas.Take(PrefetchedSearchResults))
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await GetMetaAsync(meta).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    log.LogDebug(ex, "PrefetchMetas: no meta for {Id} ahead of a click", meta.Id);
+                }
+            });
+        }
+    }
+
     /// <summary>
     /// Whether the addon is AIOStreams. Instances can rebrand the manifest id
     /// (<c>com.aiostreams.viren070</c> by default) and name, but keep the product in one of them.
