@@ -477,13 +477,7 @@ public sealed class GelatoManager(
         }
         else
         {
-            baseItem = await SyncSeriesTreesAsync(
-                    cfg,
-                    meta,
-                    ct,
-                    refreshNewSeries: !refreshItem
-                )
-                .ConfigureAwait(false);
+            baseItem = await SyncSeriesTreesAsync(cfg, meta, ct).ConfigureAwait(false);
         }
 
         if (baseItem is null)
