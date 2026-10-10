@@ -153,7 +153,8 @@ public class StremioAddonClient(string baseUrl, IHttpClientFactory http, ILogger
         string id,
         string mediaType,
         string? search = null,
-        int? skip = null
+        int? skip = null,
+        bool light = false
     )
     {
         var extras = new List<string>();
@@ -161,6 +162,8 @@ public class StremioAddonClient(string baseUrl, IHttpClientFactory http, ILogger
             extras.Add($"search={Uri.EscapeDataString(search)}");
         if (skip is > 0)
             extras.Add($"skip={skip}");
+        if (light)
+            extras.Add("light=1");
 
         // seen maybe one type thats capital, but thats their issue
         var r = await GetJsonAsync<StremioCatalogResponse>(
