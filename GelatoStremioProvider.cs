@@ -665,7 +665,8 @@ public class GelatoStremioProvider(
         string id,
         string mediaType,
         string? search = null,
-        int? skip = null
+        int? skip = null,
+        bool light = false
     )
     {
         var extras = new List<string>();
@@ -673,6 +674,8 @@ public class GelatoStremioProvider(
             extras.Add($"search={Uri.EscapeDataString(search)}");
         if (skip is > 0)
             extras.Add($"skip={skip}");
+        if (light)
+            extras.Add("light=1");
 
         // seen maybe one type thats capital, but thats their issue
         var url = BuildUrl(["catalog", mediaType.ToLower(), id], extras);
@@ -706,7 +709,19 @@ public class GelatoStremioProvider(
             return [];
         }
 
-        return await GetCatalogMetasAsync(catalog.Id, mediaType.ToString(), query, skip);
+        // aiometadata answers a search with light=1 from the search results alone, without a
+        // details request per result: 0.2 to 0.4 s instead of 1 to 2.4 s for a movie search,
+        // with the poster, background, ids and rating a result list shows. What it leaves out
+        // (logo, runtime, keywords) comes with the full meta when a result is opened.
+        // AIOStreams passes the extra on to the addon serving the catalog; other addons are not
+        // sent an extra they never declared.
+        return await GetCatalogMetasAsync(
+            catalog.Id,
+            mediaType.ToString(),
+            query,
+            skip,
+            light: IsAioStreams(manifest)
+        );
     }
 }
 
