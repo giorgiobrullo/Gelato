@@ -33,12 +33,52 @@ public class GelatoStremioProvider(
         string?
     > _tmdbIdByImdbId = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// The meta requests on their way, by type and id: a search result opened while its prefetch
+    /// (<see cref="PrefetchMetas"/>) is still asking waits for that answer instead of asking again.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<
+        string,
+        Lazy<Task<StremioMeta?>>
+    > _metaInFlight = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>How many results of a search get their meta asked for ahead of a click.</summary>
+    public const int PrefetchedSearchResults = 4;
+
     private StremioMeta? GetCachedMeta(string id)
     {
         if (_metaCache.TryGetValue(id, out var entry) && entry.Expiry > DateTime.UtcNow)
             return entry.Meta;
         _metaCache.TryRemove(id, out _);
         return null;
+    }
+
+    /// <summary>
+    /// Asks for the full meta of the first search results in the background, so opening one
+    /// finds it in the meta cache.
+    /// </summary>
+    /// <remarks>
+    /// Opening a result that is not in the library waits for its full meta before the item can be
+    /// inserted: 0.4 to 2 seconds while aiometadata builds a title it has not built before, 50 to
+    /// 100 ms once it has. Search only gets the catalog's previews, so the wait came with every
+    /// first click. The answers stay in the cache for <see cref="MetaCacheTtl"/>.
+    /// </remarks>
+    public void PrefetchMetas(IEnumerable<StremioMeta> metas)
+    {
+        foreach (var meta in metas.Take(PrefetchedSearchResults))
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await GetMetaAsync(meta).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    log.LogDebug(ex, "PrefetchMetas: no meta for {Id} ahead of a click", meta.Id);
+                }
+            });
+        }
     }
 
     private const string AioStreamsUserAgent = "AIOStreams/1.0";
@@ -208,11 +248,26 @@ public class GelatoStremioProvider(
         if (cached is not null)
             return cached;
 
-        var url = BuildUrl(["meta", mediaType.ToString().ToLower(), id]);
-        var r = await GetJsonAsync<StremioMetaResponse>(url);
-        if (r?.Meta is { } meta)
-            _metaCache[id] = (meta, DateTime.UtcNow.Add(ttl ?? MetaCacheTtl));
-        return r?.Meta;
+        var key = $"{mediaType}:{id}";
+        var request = _metaInFlight.GetOrAdd(
+            key,
+            _ => new Lazy<Task<StremioMeta?>>(async () =>
+            {
+                var url = BuildUrl(["meta", mediaType.ToString().ToLower(), id]);
+                var r = await GetJsonAsync<StremioMetaResponse>(url).ConfigureAwait(false);
+                if (r?.Meta is { } meta)
+                    _metaCache[id] = (meta, DateTime.UtcNow.Add(ttl ?? MetaCacheTtl));
+                return r?.Meta;
+            })
+        );
+        try
+        {
+            return await request.Value.ConfigureAwait(false);
+        }
+        finally
+        {
+            _metaInFlight.TryRemove(new KeyValuePair<string, Lazy<Task<StremioMeta?>>>(key, request));
+        }
     }
 
     /// <summary>
