@@ -1535,9 +1535,41 @@ public sealed class GelatoManager(
     /// is one: every Gelato item takes its id from the hash of its path
     /// (<see cref="ILibraryManager.GetNewItemId"/>), so two items at the same path are one row.
     /// </summary>
+    /// <remarks>
+    /// <see cref="ILibraryManager.GetItemById(Guid)"/> answers from the item cache, which keeps an
+    /// item after the database lost its row: a library scan that removes a whole tree leaves its
+    /// seasons and episodes cached until Jellyfin restarts. Taken as existing, such a season is not
+    /// saved again, and every episode under it then fails its parent foreign key, so a series
+    /// re-added after the scan came back with no episodes at all. Only a row the database still
+    /// has counts.
+    /// </remarks>
     private T? ExistingItemAt<T>(string path)
-        where T : BaseItem =>
-        libraryManager.GetItemById(libraryManager.GetNewItemId(path, typeof(T))) as T;
+        where T : BaseItem
+    {
+        var id = libraryManager.GetNewItemId(path, typeof(T));
+        if (libraryManager.GetItemById(id) is not T item)
+        {
+            return null;
+        }
+
+        // The skip filter marker: a row the decorators would hide (an unreleased episode) still
+        // exists, and treating it as gone would overwrite it.
+        var stored = libraryManager.GetItemIds(
+            new InternalItemsQuery { ItemIds = [id], IsDeadPerson = true }
+        );
+        if (stored.Count == 0)
+        {
+            _log.LogDebug(
+                "{Kind} {Name} ({Id}) is cached but no longer in the database, creating it again",
+                typeof(T).Name,
+                item.Name,
+                id
+            );
+            return null;
+        }
+
+        return item;
+    }
 
     public async Task<BaseItem?> SyncSeriesTreesAsync(
         PluginConfiguration cfg,
