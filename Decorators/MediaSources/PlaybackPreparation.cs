@@ -360,7 +360,11 @@ internal sealed class PlaybackPreparation(
             var segmentTask = segmentLookups.IsDue(owner, libraryOptions)
                 ? decorator.Segments.RunSegmentProvidersAsync(owner, libraryOptions, ct)
                 : Task.CompletedTask;
-            var metadataTask = decorator.Probe.ProbeStreamAsync((Video)owner, selected.Path, ct);
+            var metadataTask = decorator.Probe.ProbeStreamAsync(
+                (Video)owner,
+                preProbe ? PreProbes.PrefetchUrl(selected.Path) : selected.Path,
+                ct
+            );
             //  var subtitleTask = DownloadSubtitles((Video)owner, ct);
 
             await Task.WhenAll(metadataTask, segmentTask).ConfigureAwait(false);

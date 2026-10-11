@@ -267,7 +267,7 @@ internal sealed class PreProbes(
             if (
                 GelatoPlugin.Instance!.Configuration.PlaybackFailover
                 && !PlaybackPreparation.NeedsProbe(source)
-                && StreamLinks.AsHttpUri(source.Path) is { } uri
+                && StreamLinks.AsHttpUri(PrefetchUrl(source.Path)) is { } uri
             )
             {
                 var reason = await StreamLinks
@@ -422,6 +422,31 @@ internal sealed class PreProbes(
     // A warm-up's answer and its read get this long each.
     private static readonly TimeSpan WarmTimeout = TimeSpan.FromSeconds(20);
 
+    /// <summary>
+    /// Marks an AIOStreams playback link as asked for ahead of playback (warming it, probing it):
+    /// AIOStreams then resolves no service that downloads the whole torrent to serve it
+    /// (qBittorrent), neither the stream nor a failover to one. Warming a TorBox stream that
+    /// failed over to the same release on qBittorrent made it download a 90 GB private-tracker
+    /// torrent for a page nobody played. Other links are left as they are.
+    /// </summary>
+    /// <remarks>
+    /// The query goes before a fragment (the '#' a source's link carries against Jellyfin's
+    /// keyframe extractor, see <see cref="VersionList"/>): after it, it would be part of the
+    /// fragment, which is never sent.
+    /// </remarks>
+    internal static string PrefetchUrl(string url)
+    {
+        if (string.IsNullOrEmpty(url) || !url.Contains("/debrid/playback/", StringComparison.Ordinal))
+        {
+            return url;
+        }
+
+        var hash = url.IndexOf('#', StringComparison.Ordinal);
+        var link = hash < 0 ? url : url[..hash];
+        var fragment = hash < 0 ? string.Empty : url[hash..];
+        return link + (link.Contains('?', StringComparison.Ordinal) ? "&" : "?") + "prefetch=1" + fragment;
+    }
+
     private const int WarmBytes = 64 * 1024;
 
     private readonly ConcurrentDictionary<string, DateTime> _warmedLinks = new();
@@ -439,7 +464,7 @@ internal sealed class PreProbes(
     /// </remarks>
     private async Task WarmStreamLinkAsync(MediaSourceInfo source, CancellationToken ct)
     {
-        if (IsPlaceholder(source) || StreamLinks.AsHttpUri(source.Path) is not { } uri)
+        if (IsPlaceholder(source) || StreamLinks.AsHttpUri(PrefetchUrl(source.Path)) is not { } uri)
         {
             _log.LogDebug("Not warming source {Source}: no stream link to open", source.Id);
             return;
