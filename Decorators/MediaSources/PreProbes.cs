@@ -8,7 +8,6 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
-using MediaBrowser.Model.MediaInfo;
 using MediaBrowser.Model.Session;
 using Microsoft.Extensions.Logging;
 
@@ -248,7 +247,7 @@ internal sealed class PreProbes(
                 }
             }
 
-            await decorator.Playback.GetPlaybackMediaSourcesCore(
+            var prepared = await decorator.Playback.GetPlaybackMediaSourcesCore(
                     current,
                     user,
                     true,
@@ -261,7 +260,13 @@ internal sealed class PreProbes(
                 .ConfigureAwait(false);
             probed = true;
 
-            await WarmStreamLinkAsync(source, timeout.Token).ConfigureAwait(false);
+            // The source as playback resolves it: the static one handed in does not carry the
+            // stream's link.
+            var played =
+                prepared.FirstOrDefault(s =>
+                    string.Equals(s.Id, source.Id, StringComparison.OrdinalIgnoreCase)
+                ) ?? source;
+            await WarmStreamLinkAsync(played, timeout.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested)
         {
@@ -394,12 +399,9 @@ internal sealed class PreProbes(
     /// </remarks>
     private async Task WarmStreamLinkAsync(MediaSourceInfo source, CancellationToken ct)
     {
-        if (
-            source.Protocol != MediaProtocol.Http
-            || IsPlaceholder(source)
-            || !Uri.TryCreate(source.Path, UriKind.Absolute, out var uri)
-        )
+        if (IsPlaceholder(source) || StreamLinks.AsHttpUri(source.Path) is not { } uri)
         {
+            _log.LogDebug("Not warming source {Source}: no stream link to open", source.Id);
             return;
         }
 
