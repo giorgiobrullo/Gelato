@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Net.Http.Headers;
 using Gelato.Services;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Entities;
@@ -6,6 +8,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.MediaInfo;
 using MediaBrowser.Model.Session;
 using Microsoft.Extensions.Logging;
 
@@ -257,6 +260,8 @@ internal sealed class PreProbes(
                 )
                 .ConfigureAwait(false);
             probed = true;
+
+            await WarmStreamLinkAsync(source, timeout.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested)
         {
@@ -367,6 +372,103 @@ internal sealed class PreProbes(
     /// to probe, and probing it would save the movie on every visit. Asked before the source
     /// goes into a response, which stubs its path.
     /// </summary>
+    private static readonly TimeSpan WarmInterval = TimeSpan.FromMinutes(10);
+
+    // A warm-up's answer and its read get this long each.
+    private static readonly TimeSpan WarmTimeout = TimeSpan.FromSeconds(20);
+
+    private const int WarmBytes = 64 * 1024;
+
+    private readonly ConcurrentDictionary<string, DateTime> _warmedLinks = new();
+
+    /// <summary>
+    /// Opens a stream's link ahead of playback, so the playback that follows finds it ready.
+    /// </summary>
+    /// <remarks>
+    /// StremThru asks the debrid service for a download link only when a stream is first opened,
+    /// about 3 s that the first playback, and the subtitle read started with it, would wait for. A
+    /// probe opens the stream, but a source playing on RemuxDB's media info or probed before is
+    /// not probed again (the common case), so its first bytes are read here instead. At most once
+    /// per stream every <see cref="WarmInterval"/>. Through the stream client, which holds the
+    /// connection to <see cref="StreamHosts"/>' rule like every other fetch of a stream link.
+    /// </remarks>
+    private async Task WarmStreamLinkAsync(MediaSourceInfo source, CancellationToken ct)
+    {
+        if (
+            source.Protocol != MediaProtocol.Http
+            || IsPlaceholder(source)
+            || !Uri.TryCreate(source.Path, UriKind.Absolute, out var uri)
+        )
+        {
+            return;
+        }
+
+        var key = PreProbeKey(source);
+        var now = DateTime.UtcNow;
+        if (_warmedLinks.TryGetValue(key, out var last) && now - last < WarmInterval)
+            return;
+
+        _warmedLinks[key] = now;
+        if (_warmedLinks.Count > 500)
+        {
+            foreach (var stale in _warmedLinks.Where(kv => now - kv.Value >= WarmInterval).ToList())
+                _warmedLinks.TryRemove(stale);
+        }
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            using var response = await StreamLinks
+                .TryGetAsync(
+                    httpClientFactory.CreateClient(StreamHosts.ClientName),
+                    uri,
+                    WarmTimeout,
+                    ct,
+                    new RangeHeaderValue(0, WarmBytes - 1)
+                )
+                .ConfigureAwait(false);
+            if (response is null)
+            {
+                _warmedLinks.TryRemove(key, out _);
+                _log.LogDebug("Warming the link of source {Source} failed: no answer", source.Id);
+                return;
+            }
+
+            using var read = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            read.CancelAfter(WarmTimeout);
+            var stream = await response.Content.ReadAsStreamAsync(read.Token).ConfigureAwait(false);
+            await using (stream.ConfigureAwait(false))
+            {
+                var buffer = new byte[16 * 1024];
+                var total = 0;
+                int n;
+                while (
+                    total < WarmBytes
+                    && (n = await stream.ReadAsync(buffer, read.Token).ConfigureAwait(false)) > 0
+                )
+                {
+                    total += n;
+                }
+            }
+
+            // The source id only: the link carries the debrid credentials.
+            _log.LogInformation(
+                "Warmed the link of source {Source} ahead of playback in {Ms}ms ({Status})",
+                source.Id,
+                stopwatch.ElapsedMilliseconds,
+                (int)response.StatusCode
+            );
+        }
+        // Never fails the pre-probe, whose preparation is done: a warm-up that ran out of time
+        // only leaves the link cold.
+        catch (Exception ex)
+            when (ex is HttpRequestException or OperationCanceledException or IOException)
+        {
+            _warmedLinks.TryRemove(key, out _);
+            _log.LogDebug("Warming the link of source {Source} failed: {Error}", source.Id, ex.Message);
+        }
+    }
+
     internal static bool IsPlaceholder(MediaSourceInfo source) =>
         string.IsNullOrEmpty(source.Path) || source.Path.IsPlaceholderPath();
 }
