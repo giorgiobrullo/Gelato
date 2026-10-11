@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using Gelato.Config;
@@ -710,20 +711,90 @@ public sealed class GelatoManager(
     /// sorting. We make sure to keep a one stable version based on primaryversionid
     /// </summary>
     /// <returns></returns>
-    public async Task<int> SyncStreams(BaseItem item, Guid userId, CancellationToken ct)
+    public async Task<int> SyncStreams(
+        BaseItem item,
+        Guid userId,
+        CancellationToken ct,
+        bool removeStale = true
+    )
     {
         var count = 0;
         await RunExclusiveAsync(
                 item.Id,
                 async token =>
-                    count = await SyncStreamsCore(item, userId, token).ConfigureAwait(false),
+                    count = await SyncStreamsCore(item, userId, removeStale, token)
+                        .ConfigureAwait(false),
                 ct
             )
             .ConfigureAwait(false);
         return count;
     }
 
-    private async Task<int> SyncStreamsCore(BaseItem item, Guid userId, CancellationToken ct)
+    // AIOStreams answers once its exit condition is met (a few seconds) and lets the slower
+    // addons finish in the background into its stream cache; the sync only got the first answer
+    // and kept it for StreamTTL. Asking again a little later picks up what came after.
+    private static readonly TimeSpan[] FollowUpSyncDelays =
+    [
+        TimeSpan.FromSeconds(10),
+        TimeSpan.FromSeconds(45),
+    ];
+    private readonly ConcurrentDictionary<Guid, DateTime> _followUpSyncs = new();
+
+    /// <summary>
+    /// Syncs a title's streams again, twice, shortly after a sync: they add the streams of the
+    /// addons that answered after the first answer, and remove none (a version shown, or being
+    /// played, stays). Once per title per StreamTTL.
+    /// </summary>
+    public void ScheduleFollowUpSyncs(BaseItem item, Guid userId)
+    {
+        var now = DateTime.UtcNow;
+        var ttl = TimeSpan.FromSeconds(GelatoPlugin.Instance!.Configuration.StreamTTL);
+        if (_followUpSyncs.TryGetValue(item.Id, out var last) && now - last < ttl)
+        {
+            return;
+        }
+        _followUpSyncs[item.Id] = now;
+        foreach (var (key, at) in _followUpSyncs)
+        {
+            if (now - at >= ttl)
+            {
+                _followUpSyncs.TryRemove(key, out _);
+            }
+        }
+
+        _ = Task.Run(async () =>
+        {
+            var waited = TimeSpan.Zero;
+            foreach (var delay in FollowUpSyncDelays)
+            {
+                await Task.Delay(delay - waited).ConfigureAwait(false);
+                waited = delay;
+                try
+                {
+                    var count = await SyncStreams(item, userId, CancellationToken.None, removeStale: false)
+                        .ConfigureAwait(false);
+                    _log.LogDebug(
+                        "Follow-up stream sync for {Id} after {Delay}: {Count} streams",
+                        item.Id,
+                        delay,
+                        count
+                    );
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Follow-up stream sync failed for {Id}", item.Id);
+                    return;
+                }
+            }
+        });
+    }
+
+    private async Task<int> SyncStreamsCore(
+        BaseItem item,
+        Guid userId,
+        bool removeStale,
+        CancellationToken ct
+    )
     {
         _log.LogDebug($"SyncStreams for {item.Id}");
         var stopwatch = Stopwatch.StartNew();
@@ -1000,12 +1071,15 @@ public sealed class GelatoManager(
         }
 
         var newIds = new HashSet<Guid>(upsertedStreams.Select(x => x.Id));
-        var stale = existingByGuid
-            .Values.Where(m =>
-                !newIds.Contains(m.Id)
-                && (m.GelatoData<List<Guid>>("userIds")?.Contains(userId) ?? false)
-            )
-            .ToList();
+        // A follow-up sync only adds: what it did not get may just be an addon that failed this time.
+        var stale = removeStale
+            ? existingByGuid
+                .Values.Where(m =>
+                    !newIds.Contains(m.Id)
+                    && (m.GelatoData<List<Guid>>("userIds")?.Contains(userId) ?? false)
+                )
+                .ToList()
+            : [];
 
         foreach (var _item in stale)
         {

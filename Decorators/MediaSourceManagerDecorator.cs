@@ -242,6 +242,7 @@ public sealed class MediaSourceManagerDecorator(
                             var ttl = count > 0 ? (TimeSpan?)null : GelatoManager.EmptyStreamSyncTtl;
                             manager.SetStreamSync(cacheKey, ttl);
                             manager.SetStreamSync(itemCacheKey, ttl);
+                            manager.ScheduleFollowUpSyncs(item, userId);
                         }
                         catch (Exception ex)
                         {
