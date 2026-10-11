@@ -237,11 +237,11 @@ public sealed class MediaSourceManagerDecorator(
                             var count = await manager
                                 .SyncStreams(item, userId, ct)
                                 .ConfigureAwait(false);
-                            if (count > 0)
-                            {
-                                manager.SetStreamSync(cacheKey);
-                                manager.SetStreamSync(itemCacheKey);
-                            }
+                            // No stream: kept for a few minutes only, so the page
+                            // does not ask the addons again on every visit.
+                            var ttl = count > 0 ? (TimeSpan?)null : GelatoManager.EmptyStreamSyncTtl;
+                            manager.SetStreamSync(cacheKey, ttl);
+                            manager.SetStreamSync(itemCacheKey, ttl);
                         }
                         catch (Exception ex)
                         {

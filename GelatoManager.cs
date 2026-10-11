@@ -71,12 +71,16 @@ public sealed class GelatoManager(
     // a reset gets the older stamp and the sync before it counts as the newer one.
     private static long _streamSyncSeq;
 
-    public void SetStreamSync(string guid)
+    /// <summary>How long a sync that found no stream holds: an unreleased or unindexed title is
+    /// asked for again soon, but not on every visit of its page (1-3 s each).</summary>
+    public static readonly TimeSpan EmptyStreamSyncTtl = TimeSpan.FromMinutes(5);
+
+    public void SetStreamSync(string guid, TimeSpan? ttl = null)
     {
         memoryCache.Set(
             $"streamsync:{guid}",
             Interlocked.Increment(ref _streamSyncSeq),
-            TimeSpan.FromSeconds(GelatoPlugin.Instance!.Configuration.StreamTTL)
+            ttl ?? TimeSpan.FromSeconds(GelatoPlugin.Instance!.Configuration.StreamTTL)
         );
     }
 
