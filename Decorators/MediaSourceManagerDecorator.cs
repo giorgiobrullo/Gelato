@@ -873,7 +873,11 @@ public sealed class MediaSourceManagerDecorator(
                             false,
                             probeCt
                         );
-                        var metadataTask = ProbeStreamAsync((Video)owner, selected.Path, probeCt);
+                        var metadataTask = ProbeStreamAsync(
+                            (Video)owner,
+                            preProbe ? PrefetchUrl(selected.Path) : selected.Path,
+                            probeCt
+                        );
                         //  var subtitleTask = DownloadSubtitles((Video)owner, ct);
 
                         await Task.WhenAll(metadataTask, segmentTask).ConfigureAwait(false);
@@ -1547,6 +1551,23 @@ public sealed class MediaSourceManagerDecorator(
 
     private static readonly TimeSpan WarmInterval = TimeSpan.FromMinutes(10);
 
+    /// <summary>
+    /// Marks an AIOStreams playback link as asked for ahead of playback (warming it, probing it):
+    /// AIOStreams then resolves no service that downloads the whole torrent to serve it
+    /// (qBittorrent), neither the stream nor a failover to one. Warming a TorBox stream that
+    /// failed over to the same release on qBittorrent made it download a 90 GB private-tracker
+    /// torrent for a page nobody played. Other links are left as they are.
+    /// </summary>
+    internal static string PrefetchUrl(string url)
+    {
+        if (string.IsNullOrEmpty(url) || !url.Contains("/debrid/playback/", StringComparison.Ordinal))
+        {
+            return url;
+        }
+
+        return url + (url.Contains('?', StringComparison.Ordinal) ? "&" : "?") + "prefetch=1";
+    }
+
     private const int WarmBytes = 64 * 1024;
 
     private readonly ConcurrentDictionary<string, DateTime> _warmedLinks = new();
@@ -1565,7 +1586,7 @@ public sealed class MediaSourceManagerDecorator(
     {
         if (
             IsPlaceholder(source)
-            || !Uri.TryCreate(source.Path, UriKind.Absolute, out var uri)
+            || !Uri.TryCreate(PrefetchUrl(source.Path), UriKind.Absolute, out var uri)
             || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
         )
         {
