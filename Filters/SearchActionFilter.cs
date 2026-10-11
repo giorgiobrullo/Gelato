@@ -5,6 +5,8 @@ using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
 using MediaBrowser.Controller.Dto;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.Movies;
+using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
@@ -576,12 +578,21 @@ public class SearchActionFilter(
         return (dtos, covered);
     }
 
+    private static readonly string MovieTypeName = typeof(Movie).ToString();
+    private static readonly string SeriesTypeName = typeof(Series).ToString();
+
     /// <summary>
     /// The library items any of the results stands in for, in two queries for the whole search:
     /// the items holding one of the results' provider ids, then those items. Asking
     /// <see cref="GelatoManager.FindExistingItem"/> per result cost a query each, about 16 ms, and
     /// most results are not in the library, so the miss has to be the cheap case.
     /// </summary>
+    /// <remarks>
+    /// The provider ids are looked up from the movies and series, the only items the second query
+    /// keeps: their index leads with the type. Looking the values up in the provider ids directly
+    /// scanned all of them (150,000 rows, most of them people's, the index leads with the provider
+    /// name and then the item), 23 to 60 ms of every search; from the few hundred titles it is 2 ms.
+    /// </remarks>
     private async Task<IReadOnlyList<BaseItem>> FindLibraryItemsAsync(
         IEnumerable<BaseItem> candidates,
         User? user,
@@ -601,7 +612,9 @@ public class SearchActionFilter(
             // Names and values are matched separately, so a pair from two different results
             // can match too; FindMatch sorts that out on the loaded items.
             itemIds = await db
-                .BaseItemProviders.AsNoTracking()
+                .BaseItems.AsNoTracking()
+                .Where(b => b.Type == MovieTypeName || b.Type == SeriesTypeName)
+                .Join(db.BaseItemProviders, b => b.Id, p => p.ItemId, (b, p) => p)
                 .Where(p => names.Contains(p.ProviderId) && values.Contains(p.ProviderValue))
                 .Select(p => p.ItemId)
                 .Distinct()
