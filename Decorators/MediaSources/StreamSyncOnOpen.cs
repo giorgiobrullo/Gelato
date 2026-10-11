@@ -104,6 +104,7 @@ internal sealed class StreamSyncOnOpen(
                             generation,
                             count > 0 ? null : GelatoManager.EmptyStreamSyncTtl
                         );
+                        manager.ScheduleFollowUpSyncs(item, userId);
                     }
                     catch (Exception ex)
                     {
