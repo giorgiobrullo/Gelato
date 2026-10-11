@@ -176,6 +176,7 @@ public sealed class MediaSourceManagerDecorator(
             }
         }
 
+        var streamsPending = false;
         if (!allowSync)
         {
             _log.LogDebug(
@@ -193,7 +194,7 @@ public sealed class MediaSourceManagerDecorator(
         else if (uri is not null && !isStreamRow && !manager.HasStreamSync(cacheKey, syncItemId))
         {
             // Bug in web UI that calls the detail page twice. So that's why there's a lock.
-            _lock
+            var sync = _lock
                 .RunSingleFlightAsync(
                     item.Id,
                     async ct =>
@@ -247,12 +248,27 @@ public sealed class MediaSourceManagerDecorator(
                             _log.LogError(ex, "Failed to sync streams for {Id}", item.Id);
                         }
                     }
-                )
-                .GetAwaiter()
-                .GetResult();
+                );
 
-            // refresh item
-            libraryManager.GetItemById(item.Id);
+            // The web client's page does not wait for the addons (5-12 s for a title nobody
+            // opened): it shows the page at once, with a loading version picker while the sources
+            // are placeholders, and asks again. Playback, and every other client, still waits.
+            if (_http.ReadRequest(IsWebPageLoad, false) && !sync.IsCompleted)
+            {
+                streamsPending = true;
+            }
+            else
+            {
+                sync.GetAwaiter().GetResult();
+
+                // refresh item
+                libraryManager.GetItemById(item.Id);
+            }
+        }
+        else if (uri is not null && !isStreamRow && _lock.IsInFlight(item.Id))
+        {
+            // Another request (the page's twin, or a playback) is syncing it.
+            streamsPending = _http.ReadRequest(IsWebPageLoad, false);
         }
 
         var itemId = item.Id.ToString("N", CultureInfo.InvariantCulture);
@@ -413,6 +429,13 @@ public sealed class MediaSourceManagerDecorator(
         }
         sources[0].Type = MediaSourceType.Default;
 
+        // Streams still being fetched for the web page: it shows a loading picker for these.
+        if (streamsPending && sources.All(IsPlaceholder))
+        {
+            foreach (var source in sources)
+                source.Type = MediaSourceType.Placeholder;
+        }
+
         // A page opened or another version picked: the web client loads the version's row as an
         // item when the dropdown changes, so this is also the pick of a version.
         if (
@@ -434,6 +457,19 @@ public sealed class MediaSourceManagerDecorator(
     /// page sends no Fields and gets every field. A script that asks for some fields of the item
     /// (KefinTweaks' home sections ask for People) has not opened its page.
     /// </summary>
+    /// <summary>
+    /// A page of the web client: its item request, from the client that knows to show a loading
+    /// version picker for placeholder sources and to ask again (jellyfin-web custom-patches-12).
+    /// </summary>
+    private static bool IsWebPageLoad(HttpContext ctx) =>
+        ctx.GetActionName() is "GetItem" or "GetItemLegacy"
+        && RequestsMediaSources(ctx)
+        && string.Equals(
+            ctx.User.FindFirst("Jellyfin-Client")?.Value,
+            "Jellyfin Web",
+            StringComparison.Ordinal
+        );
+
     private static bool RequestsMediaSources(HttpContext ctx) =>
         !ctx.Request.Query.TryGetValue("fields", out var fields)
         || fields.Any(value =>

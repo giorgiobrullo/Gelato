@@ -162,6 +162,9 @@ public sealed class KeyLock
         return lazy.Value;
     }
 
+    /// <summary>Whether a single-flight run for the key is under way.</summary>
+    public bool IsInFlight(Guid key) => _inflight.ContainsKey(key);
+
     public async Task RunQueuedAsync(
         Guid key,
         Func<CancellationToken, Task> action,
