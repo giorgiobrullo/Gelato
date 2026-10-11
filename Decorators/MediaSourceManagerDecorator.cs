@@ -1411,7 +1411,7 @@ public sealed class MediaSourceManagerDecorator(
             if (_libraryManager.GetItemById(item.Id) is not { } current)
                 return;
 
-            await GetPlaybackMediaSourcesCore(
+            var prepared = await GetPlaybackMediaSourcesCore(
                     current,
                     user,
                     true,
@@ -1422,7 +1422,13 @@ public sealed class MediaSourceManagerDecorator(
                 )
                 .ConfigureAwait(false);
 
-            await WarmStreamLinkAsync(source, timeout.Token).ConfigureAwait(false);
+            // The source as playback resolves it: the static one handed in does not carry the
+            // stream's link.
+            var played =
+                prepared.FirstOrDefault(s =>
+                    string.Equals(s.Id, source.Id, StringComparison.OrdinalIgnoreCase)
+                ) ?? source;
+            await WarmStreamLinkAsync(played, timeout.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested)
         {
@@ -1521,11 +1527,12 @@ public sealed class MediaSourceManagerDecorator(
     private async Task WarmStreamLinkAsync(MediaSourceInfo source, CancellationToken ct)
     {
         if (
-            source.Protocol != MediaProtocol.Http
-            || IsPlaceholder(source)
+            IsPlaceholder(source)
             || !Uri.TryCreate(source.Path, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
         )
         {
+            _log.LogDebug("Not warming source {Source}: no stream link to open", source.Id);
             return;
         }
 
