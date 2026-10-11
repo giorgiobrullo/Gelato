@@ -31,16 +31,29 @@ internal sealed class StreamSyncOnOpen(
         return userId != Guid.Empty ? $"{userId}:{key}" : key;
     }
 
+    /// <summary>Whether a sync of the item's streams is under way.</summary>
+    internal bool IsSyncing(Guid itemId) => _lock.IsInFlight(itemId);
+
     /// <summary>
     /// Syncs the item's streams for the user, once at a time per item, and waits for it: the
     /// version list built next lists what the sync wrote.
     /// </summary>
-    internal void SyncNow(BaseItem item, Guid userId, StremioUri uri, string cacheKey)
+    /// <param name="background">
+    /// Not to wait for a sync that is still running: the caller answers without its streams.
+    /// </param>
+    /// <returns>Whether the sync is still running (only with <paramref name="background"/>).</returns>
+    internal bool SyncNow(
+        BaseItem item,
+        Guid userId,
+        StremioUri uri,
+        string cacheKey,
+        bool background = false
+    )
     {
         var manager = _manager.Value;
 
         // Bug in web UI that calls the detail page twice. So that's why there's a lock.
-        _lock
+        var sync = _lock
             .RunSingleFlightAsync(
                 item.Id,
                 async ct =>
@@ -94,12 +107,16 @@ internal sealed class StreamSyncOnOpen(
                         _log.LogError(ex, "Failed to sync streams for {Id}", item.Id);
                     }
                 }
-            )
-            .GetAwaiter()
-            .GetResult();
+            );
+
+        if (background && !sync.IsCompleted)
+            return true;
+
+        sync.GetAwaiter().GetResult();
 
         // refresh item
         _libraryManager.GetItemById(item.Id);
+        return false;
     }
 
     /// <summary>The sync <see cref="SyncNow"/> runs, when the item's streams are not synced.</summary>
