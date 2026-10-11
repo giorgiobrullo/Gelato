@@ -757,6 +757,12 @@ public class SearchActionFilter(
     /// are matched, and taken from Jellyfin's item cache: loading the 90 titles a Suggestions tab's
     /// TMDB lists match on a prod copy as one listing cost 50 to 70 ms, the query itself 6 ms.
     /// </summary>
+    /// <remarks>
+    /// The provider ids are looked up from the movies and series, the only items either path below
+    /// keeps: their index leads with the type. Looking the values up in the provider ids directly
+    /// scanned all of them (150,000 rows, most of them people's, the index leads with the provider
+    /// name and then the item), 23 to 60 ms of every search; from the few hundred titles it is 2 ms.
+    /// </remarks>
     internal async Task<IReadOnlyList<BaseItem>> FindLibraryItemsAsync(
         IEnumerable<BaseItem> candidates,
         CancellationToken ct,
@@ -775,18 +781,17 @@ public class SearchActionFilter(
         {
             // Names and values are matched separately, so a pair from two different results
             // can match too; FindMatches sorts that out on the loaded items.
-            var matches = db
-                .BaseItemProviders.AsNoTracking()
-                .Where(p => names.Contains(p.ProviderId) && values.Contains(p.ProviderValue));
+            var titles = db
+                .BaseItems.AsNoTracking()
+                .Where(b => b.Type == MovieType || b.Type == SeriesType);
             if (titlesOnly)
             {
-                matches = matches.Where(p =>
-                    (p.Item.Type == MovieType || p.Item.Type == SeriesType)
-                    && p.Item.PrimaryVersionId == null
-                );
+                titles = titles.Where(b => b.PrimaryVersionId == null);
             }
 
-            itemIds = await matches
+            itemIds = await titles
+                .Join(db.BaseItemProviders, b => b.Id, p => p.ItemId, (b, p) => p)
+                .Where(p => names.Contains(p.ProviderId) && values.Contains(p.ProviderValue))
                 .Select(p => p.ItemId)
                 .Distinct()
                 .ToArrayAsync(ct)
