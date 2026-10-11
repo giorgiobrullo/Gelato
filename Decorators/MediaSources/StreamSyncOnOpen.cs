@@ -97,10 +97,13 @@ internal sealed class StreamSyncOnOpen(
                         var count = await manager
                             .SyncStreams(item, userId, ct)
                             .ConfigureAwait(false);
-                        if (count > 0)
-                        {
-                            manager.SetStreamSync(cacheKey, generation);
-                        }
+                        // No stream: kept for a few minutes only, so the page does not ask
+                        // the addons again on every visit.
+                        manager.SetStreamSync(
+                            cacheKey,
+                            generation,
+                            count > 0 ? null : GelatoManager.EmptyStreamSyncTtl
+                        );
                     }
                     catch (Exception ex)
                     {
