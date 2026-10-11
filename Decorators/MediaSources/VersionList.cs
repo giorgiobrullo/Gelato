@@ -82,6 +82,7 @@ internal sealed class VersionList(
         // is hashed), but its rows went with it, so it must sync anew within StreamTTL.
         var cacheKey = StreamSyncOnOpen.SyncCacheKey(item, userId);
 
+        var streamsPending = false;
         if (!allowSync)
         {
             _log.LogDebug(
@@ -92,7 +93,21 @@ internal sealed class VersionList(
         }
         else if (uri is not null && !isStreamRow && !manager.HasStreamSync(cacheKey, syncItemId))
         {
-            decorator.Sync.SyncNow(item, userId, uri, cacheKey);
+            // The web client's page does not wait for the addons (5-12 s for a title nobody
+            // opened): it shows the page at once, with a loading version picker while the sources
+            // are placeholders, and asks again. Playback, and every other client, still waits.
+            streamsPending = decorator.Sync.SyncNow(
+                item,
+                userId,
+                uri,
+                cacheKey,
+                background: _http.ReadRequest(IsWebPageLoad, false)
+            );
+        }
+        else if (uri is not null && !isStreamRow && decorator.Sync.IsSyncing(item.Id))
+        {
+            // Another request (the page's twin, or a playback) is syncing it.
+            streamsPending = _http.ReadRequest(IsWebPageLoad, false);
         }
 
         var itemId = item.Id.ToString("N", CultureInfo.InvariantCulture);
@@ -240,6 +255,13 @@ internal sealed class VersionList(
         }
         sources[0].Type = MediaSourceType.Default;
 
+        // Streams still being fetched for the web page: it shows a loading picker for these.
+        if (streamsPending && sources.All(PreProbes.IsPlaceholder))
+        {
+            foreach (var source in sources)
+                source.Type = MediaSourceType.Placeholder;
+        }
+
         // A page opened or another version picked: the web client loads the version's row as an
         // item when the dropdown changes, so this is also the pick of a version.
         if (
@@ -258,6 +280,21 @@ internal sealed class VersionList(
 
         return sources;
     }
+
+    /// <summary>
+    /// A page of the web client: its item request, from the client that knows to show a loading
+    /// version picker for placeholder sources and to ask again (jellyfin-web custom-patches-12).
+    /// Not the item menu's read of the item, which wants the item as the library has it.
+    /// </summary>
+    private static bool IsWebPageLoad(HttpContext ctx) =>
+        ctx.GetActionName() is "GetItem" or "GetItemLegacy"
+        && RequestsMediaSources(ctx)
+        && !ctx.IsItemMenuRead()
+        && string.Equals(
+            ctx.User.FindFirst("Jellyfin-Client")?.Value,
+            "Jellyfin Web",
+            StringComparison.Ordinal
+        );
 
     /// <summary>
     /// Whether an item request wants the item's sources, as a page does: Jellyfin Web's details
