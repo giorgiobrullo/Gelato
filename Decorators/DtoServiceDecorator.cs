@@ -227,12 +227,16 @@ public sealed class DtoServiceDecorator(
         {
             dto.CanDownload = true;
             // mark if placeholder
+            // A placeholder the web page gets while its streams are still being fetched
+            // (MediaSourceType.Placeholder, see MediaSourceManagerDecorator) is not a missing
+            // item: marked virtual, the page would show "Missing" and no Play button.
             if (
                 isList
                 || dto.MediaSources?.Length != 1
                 || dto.Path is null
                 || !dto.MediaSources[0]
                     .Path.StartsWith("gelato", StringComparison.OrdinalIgnoreCase)
+                || dto.MediaSources[0].Type == MediaSourceType.Placeholder
             )
             {
                 StubStreamPaths(dto);
